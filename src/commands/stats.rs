@@ -581,20 +581,6 @@ fn format_by_project_section(conn: &Connection) -> String {
         }
     }
 
-    // Post-merge: check if any root is a subdirectory of another root
-    let roots: Vec<String> = projects.keys().cloned().collect();
-    for child in &roots {
-        for parent in &roots {
-            if child != parent && child.starts_with(&format!("{}/", parent)) {
-                let child_own = projects.get(child).map(|(own, _)| *own).unwrap_or(0);
-                if child_own > 0 {
-                    projects.entry(parent.clone()).or_insert((0, BTreeMap::new())).0 += child_own;
-                    projects.get_mut(child).unwrap().0 = 0;
-                }
-            }
-        }
-    }
-
     // Remove entries that have been fully merged (0 own count, no worktrees)
     projects.retain(|_, (own, wts)| *own > 0 || !wts.is_empty());
 
@@ -1387,37 +1373,5 @@ mod tests {
         assert_eq!(lines.len(), 1);
     }
 
-    #[test]
-    fn format_by_project_post_merge_child_root_into_parent() {
-        // Triggers the post-merge logic (lines 591-592) where a child root's
-        // own count is transferred to its parent root.
-        let conn = test_conn();
-        let parent = "/home/user/repos/parent";
-        let child = "/home/user/repos/parent/child";
-        let child_wt = format!("{}/.claude/worktrees/feat/src", child);
 
-        // Worktree entry creates child as a root with worktree sub-entry
-        db::insert_tool_use(&conn, "w1", "s1", "Read", "ts", &child_wt, "{}").unwrap();
-        db::insert_tool_use(&conn, "w2", "s1", "Read", "ts", &child_wt, "{}").unwrap();
-
-        // Direct tool uses in child give it own > 0 (will be merged by post-merge)
-        db::insert_tool_use(&conn, "c1", "s1", "Read", "ts", child, "{}").unwrap();
-        db::insert_tool_use(&conn, "c2", "s1", "Read", "ts", child, "{}").unwrap();
-        db::insert_tool_use(&conn, "c3", "s1", "Read", "ts", child, "{}").unwrap();
-
-        // Direct tool uses in parent create it as a separate root
-        db::insert_tool_use(&conn, "p1", "s1", "Read", "ts", parent, "{}").unwrap();
-
-        let section = format_by_project_section(&conn);
-
-        // Post-merge: child's own count (3) is moved to parent.
-        // Parent shows: 1 (own) + 3 (merged from child) = 4
-        // Child shows: 0 (own zeroed) + 2 (feat worktree) = 2
-        let lines: Vec<&str> = section.lines().collect();
-        let parent_line = lines.iter().find(|l| l.contains("/home/user/repos/parent") && !l.contains("/child")).unwrap();
-        assert!(parent_line.contains("4"), "parent should show 4 (1 own + 3 merged): {parent_line}");
-        // Child entry is retained (has worktrees) but with own=0
-        let child_line = lines.iter().find(|l| l.contains("/child")).unwrap();
-        assert!(child_line.contains("2"), "child should show 2 (worktree only): {child_line}");
-    }
 }
