@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The 6 hook events we register.
 pub const HOOK_EVENTS: &[&str] = &[
@@ -11,6 +11,36 @@ pub const HOOK_EVENTS: &[&str] = &[
     "PostToolUse",
 ];
 
+/// The standard install directory for user-local binaries.
+pub fn install_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let home = dirs::home_dir().ok_or("could not determine home directory")?;
+    Ok(home.join(".local").join("bin"))
+}
+
+/// Copy the binary to the install directory. Returns the installed path.
+pub fn copy_binary(src: &Path, dest_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    fs::create_dir_all(dest_dir)?;
+    let dest = dest_dir.join("claude-track");
+
+    let need_copy = if dest.exists() {
+        src.canonicalize()? != dest.canonicalize()?
+    } else {
+        true
+    };
+
+    if need_copy {
+        fs::copy(src, &dest)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
+    }
+
+    Ok(dest)
+}
+
 /// Install all hooks into ~/.claude/settings.json.
 #[cfg(not(tarpaulin_include))]
 pub fn run() {
@@ -21,19 +51,35 @@ pub fn run() {
 }
 
 fn try_run() -> Result<(), Box<dyn std::error::Error>> {
-    let binary_path = std::env::current_exe()?
+    let current_exe = std::env::current_exe()?;
+    let dest_dir = install_dir()?;
+    let installed_path = copy_binary(&current_exe, &dest_dir)?;
+    let installed_str = installed_path
         .to_str()
-        .ok_or("binary path is not valid UTF-8")?
-        .to_string();
+        .ok_or("installed path is not valid UTF-8")?;
 
     let settings_path = dirs::home_dir()
         .ok_or("could not determine home directory")?
         .join(".claude")
         .join("settings.json");
 
-    let command = format!("{binary_path} hook");
+    let command = format!("{installed_str} hook");
     let output = install_to(&settings_path, &command)?;
+
+    println!("Binary installed to {installed_str}");
     print!("{output}");
+
+    // Hint if install dir is not on PATH
+    if let Ok(path_var) = std::env::var("PATH") {
+        let dest_dir_str = dest_dir.to_str().unwrap_or("");
+        if !path_var.split(':').any(|p| p == dest_dir_str) {
+            println!(
+                "Tip: Add {} to your PATH to run `claude-track` from anywhere.",
+                dest_dir.display()
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -319,5 +365,57 @@ mod tests {
     fn is_hook_installed_false_no_hooks_key() {
         let settings = serde_json::json!({});
         assert!(!is_hook_installed(&settings, "PostToolUse", "claude-track hook"));
+    }
+
+    #[test]
+    fn install_dir_returns_local_bin() {
+        let dir = install_dir().unwrap();
+        assert!(dir.ends_with(".local/bin"));
+    }
+
+    #[test]
+    fn copy_binary_to_new_dir() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("source-binary");
+        fs::write(&src, b"binary content").unwrap();
+
+        let dest_dir = dir.path().join("install");
+        let result = copy_binary(&src, &dest_dir).unwrap();
+
+        assert_eq!(result, dest_dir.join("claude-track"));
+        assert_eq!(fs::read_to_string(&result).unwrap(), "binary content");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::metadata(&result).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o755);
+        }
+    }
+
+    #[test]
+    fn copy_binary_overwrites_existing() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("source-binary");
+        fs::write(&src, b"new content").unwrap();
+
+        let dest_dir = dir.path().join("install");
+        fs::create_dir_all(&dest_dir).unwrap();
+        fs::write(dest_dir.join("claude-track"), b"old content").unwrap();
+
+        let result = copy_binary(&src, &dest_dir).unwrap();
+        assert_eq!(fs::read_to_string(&result).unwrap(), "new content");
+    }
+
+    #[test]
+    fn copy_binary_same_file_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let dest_dir = dir.path();
+        let binary = dest_dir.join("claude-track");
+        fs::write(&binary, b"content").unwrap();
+
+        let result = copy_binary(&binary, dest_dir).unwrap();
+        assert_eq!(result, binary);
+        assert_eq!(fs::read_to_string(&result).unwrap(), "content");
     }
 }

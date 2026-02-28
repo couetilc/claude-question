@@ -28,12 +28,17 @@ fn try_run() -> Result<(), Box<dyn std::error::Error>> {
         .to_string();
     let command = format!("{binary_path} hook");
 
+    let bin_path = crate::commands::install::install_dir()
+        .map(|d| d.join("claude-track"))
+        .unwrap_or_default();
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let output = uninstall_from(
         &settings_path,
         &db_path,
         &log_path,
+        &bin_path,
         &command,
         &mut stdin.lock(),
         &mut stdout.lock(),
@@ -48,6 +53,7 @@ pub fn uninstall_from(
     settings_path: &Path,
     db_path: &Path,
     log_path: &Path,
+    bin_path: &Path,
     command: &str,
     input: &mut dyn BufRead,
     prompt_out: &mut dyn Write,
@@ -72,6 +78,26 @@ pub fn uninstall_from(
         }
     } else {
         output.push_str("No settings.json found.\n");
+    }
+
+    // Ask about installed binary
+    if bin_path.exists() {
+        write!(
+            prompt_out,
+            "Delete installed binary? ({}) [y/N] ",
+            bin_path.display()
+        )?;
+        prompt_out.flush()?;
+
+        let mut answer = String::new();
+        input.read_line(&mut answer)?;
+
+        if answer.trim().eq_ignore_ascii_case("y") {
+            fs::remove_file(bin_path)?;
+            output.push_str("Binary deleted.\n");
+        } else {
+            output.push_str(&format!("Binary kept at {}\n", bin_path.display()));
+        }
     }
 
     // Ask about database
@@ -342,6 +368,7 @@ mod tests {
         let settings_path = dir.path().join("settings.json");
         let db_path = dir.path().join("claude-track.db");
         let log_path = dir.path().join("tool-usage.jsonl");
+        let bin_path = dir.path().join("no-such-binary");
 
         let mut settings = serde_json::json!({});
         crate::commands::install::patch_settings(&mut settings, "cmd hook");
@@ -352,7 +379,7 @@ mod tests {
         let mut input = Cursor::new(b"n\nn\n");
         let mut prompt = Vec::new();
         let output =
-            uninstall_from(&settings_path, &db_path, &log_path, "cmd hook", &mut input, &mut prompt)
+            uninstall_from(&settings_path, &db_path, &log_path, &bin_path, "cmd hook", &mut input, &mut prompt)
                 .unwrap();
 
         assert!(output.contains("Removed 6 hook(s)"));
@@ -373,6 +400,7 @@ mod tests {
         let settings_path = dir.path().join("settings.json");
         let db_path = dir.path().join("claude-track.db");
         let log_path = dir.path().join("tool-usage.jsonl");
+        let bin_path = dir.path().join("no-such-binary");
 
         fs::write(&settings_path, "{}").unwrap();
         fs::write(&db_path, "test db").unwrap();
@@ -381,7 +409,7 @@ mod tests {
         let mut input = Cursor::new(b"y\ny\n");
         let mut prompt = Vec::new();
         let output =
-            uninstall_from(&settings_path, &db_path, &log_path, "cmd hook", &mut input, &mut prompt)
+            uninstall_from(&settings_path, &db_path, &log_path, &bin_path, "cmd hook", &mut input, &mut prompt)
                 .unwrap();
 
         assert!(output.contains("Database deleted."));
@@ -396,11 +424,12 @@ mod tests {
         let settings_path = dir.path().join("settings.json");
         let db_path = dir.path().join("claude-track.db");
         let log_path = dir.path().join("tool-usage.jsonl");
+        let bin_path = dir.path().join("no-such-binary");
 
         let mut input = Cursor::new(b"");
         let mut prompt = Vec::new();
         let output =
-            uninstall_from(&settings_path, &db_path, &log_path, "cmd hook", &mut input, &mut prompt)
+            uninstall_from(&settings_path, &db_path, &log_path, &bin_path, "cmd hook", &mut input, &mut prompt)
                 .unwrap();
 
         assert!(output.contains("No settings.json found."));
@@ -413,6 +442,7 @@ mod tests {
         let settings_path = dir.path().join("settings.json");
         let db_path = dir.path().join("claude-track.db");
         let log_path = dir.path().join("tool-usage.jsonl");
+        let bin_path = dir.path().join("no-such-binary");
 
         let settings = serde_json::json!({
             "hooks": {
@@ -427,7 +457,7 @@ mod tests {
         let mut input = Cursor::new(b"");
         let mut prompt = Vec::new();
         let output =
-            uninstall_from(&settings_path, &db_path, &log_path, "cmd hook", &mut input, &mut prompt)
+            uninstall_from(&settings_path, &db_path, &log_path, &bin_path, "cmd hook", &mut input, &mut prompt)
                 .unwrap();
 
         assert!(output.contains("No matching hooks found"));
@@ -439,13 +469,14 @@ mod tests {
         let settings_path = dir.path().join("settings.json");
         let db_path = dir.path().join("claude-track.db");
         let log_path = dir.path().join("tool-usage.jsonl");
+        let bin_path = dir.path().join("no-such-binary");
 
         fs::write(&settings_path, "{}").unwrap();
 
         let mut input = Cursor::new(b"");
         let mut prompt = Vec::new();
         let output =
-            uninstall_from(&settings_path, &db_path, &log_path, "cmd hook", &mut input, &mut prompt)
+            uninstall_from(&settings_path, &db_path, &log_path, &bin_path, "cmd hook", &mut input, &mut prompt)
                 .unwrap();
 
         // No prompts about data files
@@ -460,6 +491,7 @@ mod tests {
         let settings_path = dir.path().join("settings.json");
         let db_path = dir.path().join("claude-track.db");
         let log_path = dir.path().join("tool-usage.jsonl");
+        let bin_path = dir.path().join("no-such-binary");
 
         fs::write(&settings_path, "{}").unwrap();
         fs::write(&db_path, "test db").unwrap();
@@ -467,10 +499,55 @@ mod tests {
         let mut input = Cursor::new(b"n\n");
         let mut prompt = Vec::new();
         let output =
-            uninstall_from(&settings_path, &db_path, &log_path, "cmd hook", &mut input, &mut prompt)
+            uninstall_from(&settings_path, &db_path, &log_path, &bin_path, "cmd hook", &mut input, &mut prompt)
                 .unwrap();
 
         assert!(output.contains("Database kept at"));
         assert!(!output.contains("Legacy log"));
+    }
+
+    #[test]
+    fn uninstall_from_deletes_binary() {
+        let dir = TempDir::new().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let db_path = dir.path().join("claude-track.db");
+        let log_path = dir.path().join("tool-usage.jsonl");
+        let bin_path = dir.path().join("claude-track");
+
+        fs::write(&settings_path, "{}").unwrap();
+        fs::write(&bin_path, b"fake binary").unwrap();
+
+        let mut input = Cursor::new(b"y\n");
+        let mut prompt = Vec::new();
+        let output =
+            uninstall_from(&settings_path, &db_path, &log_path, &bin_path, "cmd hook", &mut input, &mut prompt)
+                .unwrap();
+
+        assert!(output.contains("Binary deleted."));
+        assert!(!bin_path.exists());
+
+        let prompt_str = String::from_utf8(prompt).unwrap();
+        assert!(prompt_str.contains("Delete installed binary?"));
+    }
+
+    #[test]
+    fn uninstall_from_keeps_binary() {
+        let dir = TempDir::new().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let db_path = dir.path().join("claude-track.db");
+        let log_path = dir.path().join("tool-usage.jsonl");
+        let bin_path = dir.path().join("claude-track");
+
+        fs::write(&settings_path, "{}").unwrap();
+        fs::write(&bin_path, b"fake binary").unwrap();
+
+        let mut input = Cursor::new(b"n\n");
+        let mut prompt = Vec::new();
+        let output =
+            uninstall_from(&settings_path, &db_path, &log_path, &bin_path, "cmd hook", &mut input, &mut prompt)
+                .unwrap();
+
+        assert!(output.contains("Binary kept at"));
+        assert!(bin_path.exists());
     }
 }
