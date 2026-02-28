@@ -89,7 +89,7 @@ fn format_sessions_section(conn: &Connection) -> String {
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
         .unwrap_or(0);
-    fmt::write(&mut out, format_args!("  Total sessions: {total}\n")).unwrap();
+    fmt::write(&mut out, format_args!("  Total sessions:  {:>10}\n", format_number(total))).unwrap();
 
     // Total duration: sum of (ended_at - started_at) for completed sessions
     let total_seconds: i64 = conn
@@ -103,7 +103,7 @@ fn format_sessions_section(conn: &Connection) -> String {
         .unwrap_or(0);
     fmt::write(
         &mut out,
-        format_args!("  Total duration: {}\n", format_duration(total_seconds)),
+        format_args!("  Total duration:  {:>10}\n", format_duration(total_seconds)),
     )
     .unwrap();
 
@@ -118,7 +118,7 @@ fn format_sessions_section(conn: &Connection) -> String {
         let avg = total_seconds / completed;
         fmt::write(
             &mut out,
-            format_args!("  Avg session: {}\n", format_duration(avg)),
+            format_args!("  Avg session:     {:>10}\n", format_duration(avg)),
         )
         .unwrap();
     }
@@ -130,7 +130,7 @@ fn format_sessions_section(conn: &Connection) -> String {
             |r| r.get(0),
         )
         .unwrap_or(0);
-    fmt::write(&mut out, format_args!("  Sessions today: {today}\n")).unwrap();
+    fmt::write(&mut out, format_args!("  Sessions today:  {:>10}\n", format_number(today))).unwrap();
 
     out.push('\n');
     out
@@ -215,7 +215,7 @@ fn format_prompts_section(conn: &Connection) -> String {
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM prompts", [], |r| r.get(0))
         .unwrap_or(0);
-    fmt::write(&mut out, format_args!("  Total prompts: {total}\n")).unwrap();
+    fmt::write(&mut out, format_args!("  Total prompts:   {:>10}\n", format_number(total))).unwrap();
 
     let session_count: i64 = conn
         .query_row(
@@ -228,7 +228,7 @@ fn format_prompts_section(conn: &Connection) -> String {
         let avg_per_session = total as f64 / session_count as f64;
         fmt::write(
             &mut out,
-            format_args!("  Avg per session: {avg_per_session:.1}\n"),
+            format_args!("  Avg per session: {:>10.1}\n", avg_per_session),
         )
         .unwrap();
     }
@@ -242,7 +242,7 @@ fn format_prompts_section(conn: &Connection) -> String {
         .unwrap_or(0.0);
     fmt::write(
         &mut out,
-        format_args!("  Avg length: {} chars\n", avg_length as i64),
+        format_args!("  Avg length:      {:>6} chars\n", avg_length as i64),
     )
     .unwrap();
 
@@ -257,7 +257,7 @@ fn format_tool_usage_section(conn: &Connection) -> String {
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM tool_uses", [], |r| r.get(0))
         .unwrap_or(0);
-    fmt::write(&mut out, format_args!("  Total tool calls: {total}\n")).unwrap();
+    fmt::write(&mut out, format_args!("  Total tool calls: {}\n", format_number(total))).unwrap();
 
     let mut stmt = conn
         .prepare(
@@ -270,8 +270,16 @@ fn format_tool_usage_section(conn: &Connection) -> String {
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
+    let max_count = rows.first().map(|(_, c)| *c).unwrap_or(0);
+    // Find the longest tool name for padding
+    let max_name_len = rows.iter().map(|(t, _)| t.len()).max().unwrap_or(0);
     for (tool, count) in &rows {
-        fmt::write(&mut out, format_args!("  {count:<6} {tool}\n")).unwrap();
+        let bar = make_bar(*count, max_count, 20);
+        fmt::write(
+            &mut out,
+            format_args!("  {:>6}  {:<width$}  {}\n", format_number(*count), tool, bar, width = max_name_len),
+        )
+        .unwrap();
     }
 
     out.push('\n');
@@ -295,7 +303,7 @@ fn format_top_files_section(conn: &Connection) -> String {
         .filter_map(|r| r.ok())
         .collect();
     for (path, count) in &rows {
-        fmt::write(&mut out, format_args!("  {count:<4} {path}\n")).unwrap();
+        fmt::write(&mut out, format_args!("  {:>6}  {}\n", format_number(*count), shorten_path(path, 60))).unwrap();
     }
 
     out.push('\n');
@@ -334,7 +342,7 @@ fn format_top_bash_section(conn: &Connection) -> String {
     let mut sorted: Vec<_> = cmd_counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (cmd, count) in sorted.iter().take(10) {
-        fmt::write(&mut out, format_args!("  {count:<4} {cmd}\n")).unwrap();
+        fmt::write(&mut out, format_args!("  {:>6}  {}\n", format_number(*count), cmd)).unwrap();
     }
 
     out.push('\n');
@@ -358,7 +366,7 @@ fn format_activity_by_date_section(conn: &Connection) -> String {
         .filter_map(|r| r.ok())
         .collect();
     for (date, count) in &rows {
-        fmt::write(&mut out, format_args!("  {date}  {count}\n")).unwrap();
+        fmt::write(&mut out, format_args!("  {}  {:>6}\n", date, format_number(*count))).unwrap();
     }
 
     out.push('\n');
@@ -382,7 +390,7 @@ fn format_by_project_section(conn: &Connection) -> String {
         .filter_map(|r| r.ok())
         .collect();
     for (project, count) in &rows {
-        fmt::write(&mut out, format_args!("  {count:<6} {project}\n")).unwrap();
+        fmt::write(&mut out, format_args!("  {:>6}  {}\n", format_number(*count), shorten_path(project, 60))).unwrap();
     }
 
     out
@@ -444,6 +452,45 @@ pub fn estimate_cost(input: i64, cache_creation: i64, cache_read: i64, output: i
         + (cache_creation as f64 * 3.75 / 1_000_000.0)
         + (cache_read as f64 * 0.30 / 1_000_000.0)
         + (output as f64 * 15.0 / 1_000_000.0)
+}
+
+/// Shorten a path for display: replace home dir with ~, truncate to max_len.
+/// For paths still too long, keep first component and last 2 components with `...`.
+pub fn shorten_path(path: &str, max_len: usize) -> String {
+    let mut p = path.to_string();
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy().to_string();
+        if p.starts_with(&home_str) {
+            p = format!("~{}", &p[home_str.len()..]);
+        }
+    }
+    if p.len() <= max_len {
+        return p;
+    }
+    // Split into components and keep first + last 2 with ... in between
+    let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 3 {
+        return p;
+    }
+    let first = parts[0];
+    let last_two = &parts[parts.len() - 2..];
+    let prefix = if p.starts_with('/') { "/" } else { "" };
+    let shortened = format!("{}{}/.../{}/{}", prefix, first, last_two[0], last_two[1]);
+    if shortened.len() < p.len() {
+        shortened
+    } else {
+        p
+    }
+}
+
+/// Build a proportional bar string of the given length using block chars.
+pub fn make_bar(count: i64, max_count: i64, max_width: usize) -> String {
+    if max_count == 0 {
+        return String::new();
+    }
+    let width = ((count as f64 / max_count as f64) * max_width as f64).round() as usize;
+    let width = width.max(if count > 0 { 1 } else { 0 });
+    "\u{2588}".repeat(width)
 }
 
 #[cfg(test)]
@@ -552,10 +599,10 @@ mod tests {
         assert!(report.contains("/test.db"));
         assert!(report.contains("1.0 KB"));
         assert!(report.contains("--- Sessions ---"));
-        assert!(report.contains("Total sessions: 0"));
+        assert!(report.contains("Total sessions:"));
         assert!(report.contains("--- Token Usage ---"));
         assert!(report.contains("--- Prompts ---"));
-        assert!(report.contains("Total prompts: 0"));
+        assert!(report.contains("Total prompts:"));
         assert!(report.contains("--- Tool Usage ---"));
         assert!(report.contains("Total tool calls: 0"));
         assert!(report.contains("--- Top 10 Files Read ---"));
@@ -613,14 +660,15 @@ mod tests {
 
         let report = format_report(&conn, 2048, Path::new("/test.db"));
 
-        assert!(report.contains("Total sessions: 1"));
+        assert!(report.contains("Total sessions:"));
+        assert!(report.contains("1"));
         assert!(report.contains("Tracking since:"));
         assert!(report.contains("Total tool calls: 2"));
         assert!(report.contains("Read"));
         assert!(report.contains("Bash"));
         assert!(report.contains("/src/main.rs"));
         assert!(report.contains("cargo"));
-        assert!(report.contains("Total prompts: 1"));
+        assert!(report.contains("Total prompts:"));
         assert!(report.contains("Avg per session:"));
         assert!(report.contains("Avg length:"));
         assert!(report.contains("Input tokens:"));
@@ -628,6 +676,8 @@ mod tests {
         assert!(report.contains("Est. cost"));
         assert!(report.contains("2026-02-27"));
         assert!(report.contains("/proj"));
+        // Verify bar chart characters appear for tool usage
+        assert!(report.contains("\u{2588}"));
     }
 
     #[test]
@@ -636,7 +686,8 @@ mod tests {
         db::insert_session_start(&conn, "s1", "2026-02-27T00:00:00Z", "startup", "/proj", "/t").unwrap();
 
         let report = format_report(&conn, 0, Path::new("/test.db"));
-        assert!(report.contains("Total sessions: 1"));
+        assert!(report.contains("Total sessions:"));
+        assert!(report.contains("1"));
         // No avg session since no completed sessions
         assert!(!report.contains("Avg session:"));
     }
@@ -663,7 +714,8 @@ mod tests {
         let conn = test_conn();
         let report = format_report(&conn, 0, Path::new("/test.db"));
         // Should show total 0 but not avg per session
-        assert!(report.contains("Total prompts: 0"));
+        assert!(report.contains("Total prompts:"));
+        assert!(report.contains("0"));
         assert!(!report.contains("Avg per session:"));
     }
 
@@ -676,7 +728,8 @@ mod tests {
         drop(conn);
 
         let output = run_with_path(&db_path).unwrap();
-        assert!(output.contains("Total sessions: 1"));
+        assert!(output.contains("Total sessions:"));
+        assert!(output.contains("1"));
     }
 
     #[test]
@@ -727,5 +780,119 @@ mod tests {
         // Should not show empty cwd row
         let lines: Vec<&str> = section.lines().collect();
         assert_eq!(lines.len(), 1); // Just the header
+    }
+
+    #[test]
+    fn shorten_path_short_unchanged() {
+        assert_eq!(shorten_path("/short/path", 60), "/short/path");
+    }
+
+    #[test]
+    fn shorten_path_replaces_home_dir() {
+        let home = dirs::home_dir().unwrap();
+        let long = format!("{}/repos/project/src/file.rs", home.display());
+        let shortened = shorten_path(&long, 60);
+        assert!(shortened.starts_with("~/"));
+        assert!(shortened.contains("repos/project/src/file.rs"));
+    }
+
+    #[test]
+    fn shorten_path_truncates_long() {
+        // Build a path that exceeds 60 chars even after ~ substitution
+        let home = dirs::home_dir().unwrap();
+        let long = format!(
+            "{}/very/deeply/nested/directory/structure/with/many/levels/src/file.rs",
+            home.display()
+        );
+        let shortened = shorten_path(&long, 60);
+        assert!(shortened.len() <= 60 || shortened.contains("..."));
+    }
+
+    #[test]
+    fn shorten_path_few_components_unchanged() {
+        // Paths with 3 or fewer components don't get truncated with ...
+        assert_eq!(shorten_path("/a/b/c", 3), "/a/b/c");
+    }
+
+    #[test]
+    fn shorten_path_shortened_not_shorter() {
+        // When the ... version isn't actually shorter, return original
+        // /a/b/c/d = 8 chars, shortened = /a/.../c/d = 10 chars, so original returned
+        assert_eq!(shorten_path("/a/b/c/d", 5), "/a/b/c/d");
+        // /x/y/z/w = 8 chars, shortened = /x/.../z/w = 10 chars, so original returned
+        assert_eq!(shorten_path("/x/y/z/w", 4), "/x/y/z/w");
+    }
+
+    #[test]
+    fn make_bar_zero_max() {
+        assert_eq!(make_bar(5, 0, 20), "");
+    }
+
+    #[test]
+    fn make_bar_full() {
+        let bar = make_bar(100, 100, 20);
+        assert_eq!(bar.chars().count(), 20);
+        assert!(bar.contains('\u{2588}'));
+    }
+
+    #[test]
+    fn make_bar_half() {
+        let bar = make_bar(50, 100, 20);
+        assert_eq!(bar.chars().count(), 10);
+    }
+
+    #[test]
+    fn make_bar_minimum_one() {
+        // Even a small count should show at least 1 block
+        let bar = make_bar(1, 10000, 20);
+        assert_eq!(bar.chars().count(), 1);
+    }
+
+    #[test]
+    fn make_bar_zero_count() {
+        let bar = make_bar(0, 100, 20);
+        assert_eq!(bar, "");
+    }
+
+    #[test]
+    fn format_tool_usage_with_bar() {
+        let conn = test_conn();
+        db::insert_tool_use(&conn, "tu1", "s1", "Read", "ts", "/p", "{}").unwrap();
+        db::insert_tool_use(&conn, "tu2", "s1", "Read", "ts", "/p", "{}").unwrap();
+        db::insert_tool_use(&conn, "tu3", "s1", "Edit", "ts", "/p", "{}").unwrap();
+        let section = format_tool_usage_section(&conn);
+        // Should contain bar chars and right-aligned counts
+        assert!(section.contains("\u{2588}"));
+        assert!(section.contains("Read"));
+        assert!(section.contains("Edit"));
+        assert!(section.contains("2"));
+        assert!(section.contains("1"));
+    }
+
+    #[test]
+    fn format_activity_by_date_right_aligned() {
+        let conn = test_conn();
+        db::insert_tool_use(&conn, "tu1", "s1", "Read", "2026-02-27T00:00:00Z", "/p", "{}").unwrap();
+        let section = format_activity_by_date_section(&conn);
+        assert!(section.contains("2026-02-27"));
+        assert!(section.contains("1"));
+    }
+
+    #[test]
+    fn format_sessions_aligned_values() {
+        let conn = test_conn();
+        let section = format_sessions_section(&conn);
+        // All labels should have consistent padding
+        assert!(section.contains("Total sessions:"));
+        assert!(section.contains("Total duration:"));
+        assert!(section.contains("Sessions today:"));
+    }
+
+    #[test]
+    fn format_prompts_aligned_values() {
+        let conn = test_conn();
+        let section = format_prompts_section(&conn);
+        assert!(section.contains("Total prompts:"));
+        assert!(section.contains("Avg length:"));
     }
 }
