@@ -1,6 +1,6 @@
 # claude-track
 
-A single Rust binary that tracks Claude Code tool usage via a PostToolUse hook. Replaces the previous bash scripts + jq dependency with zero runtime dependencies.
+A single Rust binary that tracks Claude Code usage analytics via 6 hooks, storing data in a local SQLite database. Zero runtime dependencies (SQLite is bundled).
 
 ## Build & run
 
@@ -11,10 +11,23 @@ cargo build --release
 
 ## Subcommands
 
-- **`log`** — Hook entrypoint. Reads JSON from stdin, appends a timestamped JSONL record to `~/.claude/tool-usage.jsonl`. Always exits 0.
-- **`stats`** — Parses the JSONL log and prints usage statistics (calls by tool, date, top files read, top bash commands, calls by project directory).
-- **`install`** — Registers the `claude-track log` command as a PostToolUse hook in `~/.claude/settings.json`.
-- **`uninstall`** — Removes the hook from settings and optionally deletes the log file.
+- **`hook`** — Hook entrypoint. Reads JSON from stdin, dispatches by `hook_event_name`, writes to SQLite (`~/.claude/claude-track.db`). Always exits 0.
+- **`stats`** — Queries SQLite and prints usage statistics (sessions, token usage with cost estimates, prompts, tool calls, top files, top bash commands, activity by date, by project).
+- **`install`** — Registers all 6 hooks in `~/.claude/settings.json`.
+- **`uninstall`** — Removes all hooks from settings and optionally deletes the database and legacy log.
+- **`migrate`** — Imports legacy `~/.claude/tool-usage.jsonl` records into the `tool_uses` table.
+- **`query`** — Runs an ad-hoc SQL query against the tracking database. Usage: `claude-track query "SELECT ..."`.
+
+## Hook coverage
+
+| Hook Event | What we capture |
+|---|---|
+| SessionStart | Insert into `sessions` (session_id, started_at, start_reason, cwd, transcript_path) |
+| SessionEnd | Update `sessions` row (ended_at, end_reason) |
+| UserPromptSubmit | Insert into `prompts` (session_id, timestamp, prompt_text) |
+| Stop | Parse transcript file, aggregate token usage, insert into `token_usage` |
+| PreToolUse | Insert into `tool_uses` (tool_name, tool_use_id, input) |
+| PostToolUse | Update matching `tool_uses` row with response_summary, or insert if no PreToolUse |
 
 ## Project layout
 
@@ -22,14 +35,25 @@ cargo build --release
 Cargo.toml
 src/
   main.rs              # CLI definition (clap derive) + subcommand dispatch
-  models.rs            # HookInput, ToolCall structs (serde)
+  models.rs            # HookInput, ToolCall, transcript parsing structs (serde)
+  db.rs                # SQLite schema, init, insert/update/query helpers
   commands/
     mod.rs
-    log.rs             # log subcommand
-    stats.rs           # stats subcommand
-    install.rs         # install subcommand
-    uninstall.rs       # uninstall subcommand
+    hook.rs            # hook subcommand (dispatches all 6 events)
+    stats.rs           # stats subcommand (queries SQLite)
+    install.rs         # install subcommand (registers 6 hooks)
+    uninstall.rs       # uninstall subcommand (removes hooks + data)
+    migrate.rs         # migrate subcommand (JSONL → SQLite)
+    query.rs           # query subcommand (ad-hoc SQL)
+tests/
+  integration.rs       # CLI integration tests
 ```
+
+## Database schema
+
+Location: `~/.claude/claude-track.db`
+
+4 normalized tables: `sessions`, `tool_uses`, `prompts`, `token_usage`. See `src/db.rs` for full schema.
 
 ## Key dependencies
 
@@ -37,6 +61,7 @@ src/
 - `serde` + `serde_json` — JSON serialization
 - `chrono` — UTC timestamps
 - `dirs` — cross-platform home directory resolution
+- `rusqlite` (bundled) — SQLite database
 
 ## Testing
 
@@ -45,12 +70,4 @@ All tests must pass with 100% code coverage.
 ```
 cargo test
 cargo tarpaulin --skip-clean
-```
-
-## Data format
-
-Each line in `~/.claude/tool-usage.jsonl` is a JSON object:
-
-```json
-{"ts":"2026-02-27T12:00:00Z","tool":"Read","session":"abc123","cwd":"/path/to/project","input":{"file_path":"/foo/bar.rs"}}
 ```
