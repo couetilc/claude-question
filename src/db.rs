@@ -162,7 +162,9 @@ pub fn insert_prompt(
     Ok(())
 }
 
-/// Insert a token usage record.
+/// Upsert a token usage record. If a row already exists for this session_id,
+/// update it with the new cumulative totals. Otherwise insert a new row.
+/// This ensures only one token_usage row per session.
 pub fn insert_token_usage(
     conn: &Connection,
     session_id: &str,
@@ -174,11 +176,12 @@ pub fn insert_token_usage(
     output_tokens: i64,
     api_call_count: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    conn.execute(
-        "INSERT INTO token_usage (session_id, timestamp, model, input_tokens, cache_creation_tokens, cache_read_tokens, output_tokens, api_call_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    let rows = conn.execute(
+        "UPDATE token_usage SET timestamp = ?1, model = ?2, input_tokens = ?3,
+            cache_creation_tokens = ?4, cache_read_tokens = ?5,
+            output_tokens = ?6, api_call_count = ?7
+         WHERE session_id = ?8",
         params![
-            session_id,
             timestamp,
             model,
             input_tokens,
@@ -186,8 +189,25 @@ pub fn insert_token_usage(
             cache_read_tokens,
             output_tokens,
             api_call_count,
+            session_id,
         ],
     )?;
+    if rows == 0 {
+        conn.execute(
+            "INSERT INTO token_usage (session_id, timestamp, model, input_tokens, cache_creation_tokens, cache_read_tokens, output_tokens, api_call_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                session_id,
+                timestamp,
+                model,
+                input_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+                output_tokens,
+                api_call_count,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -208,15 +228,22 @@ pub fn insert_migrated_tool_use(
     Ok(())
 }
 
-/// Delete duplicate token_usage rows, keeping only the one with the lowest id
-/// per duplicate group. Returns the number of rows deleted.
+/// Delete extra token_usage rows, keeping only the row with the highest
+/// api_call_count per session_id (the most complete cumulative snapshot).
+/// Returns the number of rows deleted.
 pub fn dedup_token_usage(conn: &Connection) -> Result<usize, Box<dyn std::error::Error>> {
     let deleted = conn.execute(
         "DELETE FROM token_usage WHERE id NOT IN (
-            SELECT MIN(id) FROM token_usage
-            GROUP BY session_id, timestamp, model, input_tokens,
-                     cache_creation_tokens, cache_read_tokens,
-                     output_tokens, api_call_count
+            SELECT id FROM token_usage t1
+            WHERE t1.api_call_count = (
+                SELECT MAX(t2.api_call_count) FROM token_usage t2
+                WHERE t2.session_id = t1.session_id
+            )
+            AND t1.id = (
+                SELECT MAX(t3.id) FROM token_usage t3
+                WHERE t3.session_id = t1.session_id
+                AND t3.api_call_count = t1.api_call_count
+            )
         )",
         [],
     )?;
@@ -383,6 +410,30 @@ mod tests {
     }
 
     #[test]
+    fn token_usage_upsert_replaces_existing() {
+        let conn = mem_db();
+        insert_token_usage(&conn, "s1", "ts1", "claude-sonnet-4-20250514", 100, 200, 300, 50, 1).unwrap();
+        // Second call with same session_id should update, not insert
+        insert_token_usage(&conn, "s1", "ts2", "claude-sonnet-4-20250514", 250, 400, 600, 125, 3).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM token_usage WHERE session_id='s1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let (inp, out, calls): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, api_call_count FROM token_usage WHERE session_id='s1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(inp, 250);
+        assert_eq!(out, 125);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
     fn migrated_tool_use_insert() {
         let conn = mem_db();
         insert_migrated_tool_use(&conn, "s1", "Read", "ts1", "/proj", "{}").unwrap();
@@ -412,13 +463,23 @@ mod tests {
         assert!(path.is_none());
     }
 
+    /// Helper to insert a raw token_usage row bypassing upsert logic (simulates old data).
+    fn raw_insert_token_usage(conn: &Connection, session_id: &str, api_call_count: i64, input_tokens: i64) {
+        conn.execute(
+            "INSERT INTO token_usage (session_id, timestamp, model, input_tokens, cache_creation_tokens, cache_read_tokens, output_tokens, api_call_count)
+             VALUES (?1, 'ts', 'model', ?2, 0, 0, 0, ?3)",
+            params![session_id, input_tokens, api_call_count],
+        ).unwrap();
+    }
+
     #[test]
-    fn dedup_token_usage_removes_duplicates() {
+    fn dedup_token_usage_keeps_highest_per_session() {
         let conn = mem_db();
-        // Insert 3 identical rows
-        for _ in 0..3 {
-            insert_token_usage(&conn, "s1", "ts1", "claude-sonnet-4-20250514", 100, 200, 300, 50, 1).unwrap();
-        }
+        // Simulate old cumulative rows for one session
+        raw_insert_token_usage(&conn, "s1", 5, 100);
+        raw_insert_token_usage(&conn, "s1", 10, 200);
+        raw_insert_token_usage(&conn, "s1", 15, 300);
+
         let count_before: i64 = conn
             .query_row("SELECT COUNT(*) FROM token_usage", [], |row| row.get(0))
             .unwrap();
@@ -427,14 +488,20 @@ mod tests {
         let removed = dedup_token_usage(&conn).unwrap();
         assert_eq!(removed, 2);
 
-        let count_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM token_usage", [], |row| row.get(0))
+        let (inp, calls): (i64, i64) = conn
+            .query_row(
+                "SELECT input_tokens, api_call_count FROM token_usage WHERE session_id='s1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(count_after, 1);
+        // Should keep the row with the highest api_call_count
+        assert_eq!(calls, 15);
+        assert_eq!(inp, 300);
     }
 
     #[test]
-    fn dedup_token_usage_keeps_distinct_rows() {
+    fn dedup_token_usage_keeps_distinct_sessions() {
         let conn = mem_db();
         insert_token_usage(&conn, "s1", "ts1", "claude-sonnet-4-20250514", 100, 200, 300, 50, 1).unwrap();
         insert_token_usage(&conn, "s2", "ts2", "claude-opus-4-20250514", 500, 0, 0, 200, 3).unwrap();
