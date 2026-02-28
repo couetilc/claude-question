@@ -69,6 +69,16 @@ fn try_run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Binary installed to {installed_str}");
     print!("{output}");
 
+    // Dedup token_usage rows if the database exists
+    let db_path = crate::db::db_path()?;
+    if db_path.exists() {
+        let conn = crate::db::open_db(&db_path)?;
+        let removed = crate::db::dedup_token_usage(&conn)?;
+        if removed > 0 {
+            println!("Removed {removed} duplicate token_usage rows.");
+        }
+    }
+
     // Hint if install dir is not on PATH
     if let Ok(path_var) = std::env::var("PATH") {
         let dest_dir_str = dest_dir.to_str().unwrap_or("");
@@ -117,7 +127,10 @@ pub fn install_to(
 }
 
 /// Add hook entries for all 6 events. Returns the number of hooks actually added.
+/// Removes stale claude-track hooks from other paths before adding.
 pub fn patch_settings(settings: &mut serde_json::Value, command: &str) -> usize {
+    remove_stale_hooks(settings, command);
+
     let mut added = 0;
 
     for event in HOOK_EVENTS {
@@ -128,6 +141,40 @@ pub fn patch_settings(settings: &mut serde_json::Value, command: &str) -> usize 
     }
 
     added
+}
+
+/// Remove any existing hook entries whose command contains "claude-track hook"
+/// but doesn't match `new_command` exactly. This prevents duplicate hooks when
+/// reinstalling from a different path.
+fn remove_stale_hooks(settings: &mut serde_json::Value, new_command: &str) {
+    let hooks = match settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        Some(h) => h,
+        None => return,
+    };
+
+    for event in HOOK_EVENTS {
+        let entries = match hooks.get_mut(*event).and_then(|e| e.as_array_mut()) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        entries.retain(|entry| {
+            let dominated_by_claude_track = entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|hook_list| {
+                    hook_list.iter().any(|hook| {
+                        hook.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(|cmd| cmd.contains("claude-track hook") && cmd != new_command)
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+
+            !dominated_by_claude_track
+        });
+    }
 }
 
 /// Check if a hook command is already registered for the given event.
@@ -325,6 +372,61 @@ mod tests {
         let output = install_to(&settings_path, "cmd hook").unwrap();
         assert!(output.contains("Installed successfully."));
         assert!(settings_path.exists());
+    }
+
+    #[test]
+    fn patch_replaces_stale_hooks_from_different_path() {
+        // Simulate hooks installed from target/release path
+        let mut settings = serde_json::json!({});
+        patch_settings(&mut settings, "/home/user/repos/proj/target/release/claude-track hook");
+        // Now reinstall from ~/.local/bin path
+        let added = patch_settings(&mut settings, "/home/user/.local/bin/claude-track hook");
+        assert_eq!(added, 6);
+        // Each event should have exactly 1 entry (old one removed, new one added)
+        for event in HOOK_EVENTS {
+            let hooks = settings["hooks"][event].as_array().unwrap();
+            assert_eq!(hooks.len(), 1, "event {event} should have exactly 1 hook entry");
+            assert_eq!(
+                hooks[0]["hooks"][0]["command"],
+                "/home/user/.local/bin/claude-track hook"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_preserves_non_claude_track_hooks_during_stale_removal() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "matcher": ".*",
+                        "hooks": [{"type": "command", "command": "other-tool post"}]
+                    },
+                    {
+                        "matcher": ".*",
+                        "hooks": [{"type": "command", "command": "/old/path/claude-track hook"}]
+                    }
+                ]
+            }
+        });
+        patch_settings(&mut settings, "/new/path/claude-track hook");
+        let entries = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        // Should have other-tool + new claude-track = 2 entries
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["hooks"][0]["command"], "other-tool post");
+        assert_eq!(entries[1]["hooks"][0]["command"], "/new/path/claude-track hook");
+    }
+
+    #[test]
+    fn patch_same_command_no_stale_removal() {
+        let mut settings = serde_json::json!({});
+        patch_settings(&mut settings, "claude-track hook");
+        let added = patch_settings(&mut settings, "claude-track hook");
+        assert_eq!(added, 0);
+        for event in HOOK_EVENTS {
+            let hooks = settings["hooks"][event].as_array().unwrap();
+            assert_eq!(hooks.len(), 1);
+        }
     }
 
     #[test]

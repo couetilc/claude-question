@@ -647,8 +647,10 @@ pub fn estimate_cost(input: i64, cache_creation: i64, cache_read: i64, output: i
 }
 
 /// Estimate cost using model-specific pricing.
-/// Opus: $15 / $18.75 / $1.50 / $75 per MTok
-/// Haiku: $0.80 / $1.00 / $0.08 / $4 per MTok
+/// Opus 4.5+: $5 / $6.25 / $0.50 / $25 per MTok
+/// Opus 4.0/4.1: $15 / $18.75 / $1.50 / $75 per MTok
+/// Haiku 4.5: $1 / $1.25 / $0.10 / $5 per MTok
+/// Haiku 3.5: $0.80 / $1.00 / $0.08 / $4 per MTok
 /// Sonnet/default: $3 / $3.75 / $0.30 / $15 per MTok
 pub fn estimate_cost_for_model(
     model: &str,
@@ -659,10 +661,23 @@ pub fn estimate_cost_for_model(
 ) -> f64 {
     let (input_rate, cache_create_rate, cache_read_rate, output_rate) =
         if model.contains("opus") {
-            (15.0, 18.75, 1.50, 75.0)
+            if model.contains("opus-4-5") || model.contains("opus-4-6") {
+                // Opus 4.5/4.6
+                (5.0, 6.25, 0.50, 25.0)
+            } else {
+                // Opus 4.0/4.1/3
+                (15.0, 18.75, 1.50, 75.0)
+            }
         } else if model.contains("haiku") {
-            (0.80, 1.00, 0.08, 4.0)
+            if model.contains("haiku-4-5") {
+                // Haiku 4.5
+                (1.0, 1.25, 0.10, 5.0)
+            } else {
+                // Haiku 3.5/3
+                (0.80, 1.00, 0.08, 4.0)
+            }
         } else {
+            // Sonnet (all versions same price)
             (3.0, 3.75, 0.30, 15.0)
         };
     (input as f64 * input_rate / 1_000_000.0)
@@ -1116,7 +1131,8 @@ mod tests {
     }
 
     #[test]
-    fn estimate_cost_for_model_opus() {
+    fn estimate_cost_for_model_opus_legacy() {
+        // Opus 4.0/4.1 use legacy pricing
         let cost = estimate_cost_for_model("claude-opus-4-20250514", 1_000_000, 0, 0, 0);
         assert!((cost - 15.0).abs() < 0.01);
         let cost = estimate_cost_for_model("claude-opus-4-20250514", 0, 0, 0, 1_000_000);
@@ -1124,11 +1140,37 @@ mod tests {
     }
 
     #[test]
-    fn estimate_cost_for_model_haiku() {
-        let cost = estimate_cost_for_model("claude-haiku-4-20250514", 1_000_000, 0, 0, 0);
+    fn estimate_cost_for_model_opus_4_5() {
+        let cost = estimate_cost_for_model("claude-opus-4-5-20250514", 1_000_000, 0, 0, 0);
+        assert!((cost - 5.0).abs() < 0.01);
+        let cost = estimate_cost_for_model("claude-opus-4-5-20250514", 0, 0, 0, 1_000_000);
+        assert!((cost - 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn estimate_cost_for_model_opus_4_6() {
+        let cost = estimate_cost_for_model("claude-opus-4-6", 1_000_000, 0, 0, 0);
+        assert!((cost - 5.0).abs() < 0.01);
+        let cost = estimate_cost_for_model("claude-opus-4-6", 0, 0, 0, 1_000_000);
+        assert!((cost - 25.0).abs() < 0.01);
+        let cost = estimate_cost_for_model("claude-opus-4-6", 0, 0, 1_000_000, 0);
+        assert!((cost - 0.50).abs() < 0.01);
+    }
+
+    #[test]
+    fn estimate_cost_for_model_haiku_legacy() {
+        let cost = estimate_cost_for_model("claude-haiku-3-5-20250514", 1_000_000, 0, 0, 0);
         assert!((cost - 0.80).abs() < 0.01);
-        let cost = estimate_cost_for_model("claude-haiku-4-20250514", 0, 0, 0, 1_000_000);
+        let cost = estimate_cost_for_model("claude-haiku-3-5-20250514", 0, 0, 0, 1_000_000);
         assert!((cost - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn estimate_cost_for_model_haiku_4_5() {
+        let cost = estimate_cost_for_model("claude-haiku-4-5-20251001", 1_000_000, 0, 0, 0);
+        assert!((cost - 1.0).abs() < 0.01);
+        let cost = estimate_cost_for_model("claude-haiku-4-5-20251001", 0, 0, 0, 1_000_000);
+        assert!((cost - 5.0).abs() < 0.01);
     }
 
     #[test]
@@ -1148,6 +1190,18 @@ mod tests {
 
     #[test]
     fn estimate_cost_for_model_all_components() {
+        // Opus 4.6 all-components test
+        let cost = estimate_cost_for_model(
+            "claude-opus-4-6",
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+        let expected = 5.0 + 6.25 + 0.50 + 25.0;
+        assert!((cost - expected).abs() < 0.01);
+
+        // Opus 4.0 legacy all-components test
         let cost = estimate_cost_for_model(
             "claude-opus-4-20250514",
             1_000_000,

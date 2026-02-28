@@ -208,6 +208,21 @@ pub fn insert_migrated_tool_use(
     Ok(())
 }
 
+/// Delete duplicate token_usage rows, keeping only the one with the lowest id
+/// per duplicate group. Returns the number of rows deleted.
+pub fn dedup_token_usage(conn: &Connection) -> Result<usize, Box<dyn std::error::Error>> {
+    let deleted = conn.execute(
+        "DELETE FROM token_usage WHERE id NOT IN (
+            SELECT MIN(id) FROM token_usage
+            GROUP BY session_id, timestamp, model, input_tokens,
+                     cache_creation_tokens, cache_read_tokens,
+                     output_tokens, api_call_count
+        )",
+        [],
+    )?;
+    Ok(deleted)
+}
+
 /// Get the transcript_path for a given session.
 pub fn get_transcript_path(
     conn: &Connection,
@@ -395,6 +410,42 @@ mod tests {
         let conn = mem_db();
         let path = get_transcript_path(&conn, "no_such_session").unwrap();
         assert!(path.is_none());
+    }
+
+    #[test]
+    fn dedup_token_usage_removes_duplicates() {
+        let conn = mem_db();
+        // Insert 3 identical rows
+        for _ in 0..3 {
+            insert_token_usage(&conn, "s1", "ts1", "claude-sonnet-4-20250514", 100, 200, 300, 50, 1).unwrap();
+        }
+        let count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM token_usage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_before, 3);
+
+        let removed = dedup_token_usage(&conn).unwrap();
+        assert_eq!(removed, 2);
+
+        let count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM token_usage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_after, 1);
+    }
+
+    #[test]
+    fn dedup_token_usage_keeps_distinct_rows() {
+        let conn = mem_db();
+        insert_token_usage(&conn, "s1", "ts1", "claude-sonnet-4-20250514", 100, 200, 300, 50, 1).unwrap();
+        insert_token_usage(&conn, "s2", "ts2", "claude-opus-4-20250514", 500, 0, 0, 200, 3).unwrap();
+
+        let removed = dedup_token_usage(&conn).unwrap();
+        assert_eq!(removed, 0);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM token_usage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]
