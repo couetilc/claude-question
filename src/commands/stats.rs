@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
@@ -145,14 +146,14 @@ fn format_models_section(conn: &Connection) -> String {
 
     let mut stmt = conn
         .prepare(
-            "SELECT model, COUNT(DISTINCT session_id) as sessions, COUNT(*) as api_calls,
-                    SUM(input_tokens + cache_creation_tokens + cache_read_tokens + output_tokens) as total_tokens
+            "SELECT model, COUNT(DISTINCT session_id) as sessions,
+                    SUM(input_tokens + output_tokens) as io_tokens
              FROM token_usage WHERE model IS NOT NULL AND model != ''
-             GROUP BY model ORDER BY total_tokens DESC",
+             GROUP BY model ORDER BY io_tokens DESC",
         )
         .unwrap();
-    let rows: Vec<(String, i64, i64, i64)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+    let rows: Vec<(String, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
@@ -160,18 +161,17 @@ fn format_models_section(conn: &Connection) -> String {
     if rows.is_empty() {
         out.push_str("  No model data recorded yet.\n");
     } else {
-        let max_tokens = rows.first().map(|(_, _, _, t)| *t).unwrap_or(0);
-        let max_name_len = rows.iter().map(|(m, _, _, _)| m.len()).max().unwrap_or(0);
-        for (model, sessions, api_calls, tokens) in &rows {
+        let max_tokens = rows.first().map(|(_, _, t)| *t).unwrap_or(0);
+        let max_name_len = rows.iter().map(|(m, _, _)| m.len()).max().unwrap_or(0);
+        for (model, sessions, tokens) in &rows {
             let bar = make_bar(*tokens, max_tokens, 20);
             fmt::write(
                 &mut out,
                 format_args!(
-                    "  {:<width$}  {:>8} tokens  {:>4} sessions  {:>6} API calls  {}\n",
+                    "  {:<width$}  {:>8} in/out tokens  {:>4} sessions  {}\n",
                     model,
                     format_number(*tokens),
                     format_number(*sessions),
-                    format_number(*api_calls),
                     bar,
                     width = max_name_len,
                 ),
@@ -453,6 +453,30 @@ fn format_activity_by_date_section(conn: &Connection) -> String {
     out
 }
 
+/// Extract project info from a path, identifying worktree subdirectories.
+/// Returns `(repo_root, Option<worktree_name>)`.
+///
+/// If path contains `/.claude/worktrees/<name>`, extracts the repo root
+/// (everything before `/.claude/`) and the worktree name. Any trailing
+/// subdirectory after the worktree name is discarded.
+///
+/// Otherwise returns the path as-is with no worktree name.
+pub fn extract_project_info(path: &str) -> (String, Option<String>) {
+    if let Some(idx) = path.find("/.claude/worktrees/") {
+        let repo_root = path[..idx].to_string();
+        let after = &path[idx + "/.claude/worktrees/".len()..];
+        // Worktree name is the next path component (before any '/')
+        let wt_name = after.split('/').next().unwrap_or(after).to_string();
+        if wt_name.is_empty() {
+            (repo_root, None)
+        } else {
+            (repo_root, Some(wt_name))
+        }
+    } else {
+        (path.to_string(), None)
+    }
+}
+
 fn format_by_project_section(conn: &Connection) -> String {
     let mut out = String::new();
     out.push_str("--- By Project ---\n");
@@ -469,8 +493,95 @@ fn format_by_project_section(conn: &Connection) -> String {
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
-    for (project, count) in &rows {
-        fmt::write(&mut out, format_args!("  {:>6}  {}\n", format_number(*count), shorten_path(project, 60))).unwrap();
+
+    // Pass 1: extract project info for each row
+    let parsed: Vec<(String, Option<String>, i64)> = rows
+        .iter()
+        .map(|(path, count)| {
+            let (root, wt) = extract_project_info(path);
+            (root, wt, *count)
+        })
+        .collect();
+
+    // Pass 2: aggregate into projects map
+    // repo_root -> (own_count, BTreeMap<worktree_name, count>)
+    let mut projects: BTreeMap<String, (i64, BTreeMap<String, i64>)> = BTreeMap::new();
+
+    // First, insert all worktree entries and direct (non-subdir) entries
+    for (repo_root, wt_name, count) in &parsed {
+        let entry = projects.entry(repo_root.clone()).or_insert((0, BTreeMap::new()));
+        if let Some(name) = wt_name {
+            *entry.1.entry(name.clone()).or_insert(0) += count;
+        }
+    }
+
+    // Now handle non-worktree entries, merging subdirs into parent roots
+    for (repo_root, wt_name, count) in &parsed {
+        if wt_name.is_some() {
+            continue;
+        }
+        // Check if this path is a subdirectory of an existing repo root
+        let parent = {
+            let mut found = None;
+            for root in projects.keys() {
+                if root != repo_root && repo_root.starts_with(&format!("{}/", root)) {
+                    found = Some(root.clone());
+                    break;
+                }
+            }
+            found
+        };
+        if let Some(parent_root) = parent {
+            projects.entry(parent_root).or_insert((0, BTreeMap::new())).0 += count;
+            // Mark this entry for removal if it was created as empty
+        } else {
+            projects.entry(repo_root.clone()).or_insert((0, BTreeMap::new())).0 += count;
+        }
+    }
+
+    // Post-merge: check if any root is a subdirectory of another root
+    let roots: Vec<String> = projects.keys().cloned().collect();
+    for child in &roots {
+        for parent in &roots {
+            if child != parent && child.starts_with(&format!("{}/", parent)) {
+                let child_own = projects.get(child).map(|(own, _)| *own).unwrap_or(0);
+                if child_own > 0 {
+                    projects.entry(parent.clone()).or_insert((0, BTreeMap::new())).0 += child_own;
+                    projects.get_mut(child).unwrap().0 = 0;
+                }
+            }
+        }
+    }
+
+    // Remove entries that have been fully merged (0 own count, no worktrees)
+    projects.retain(|_, (own, wts)| *own > 0 || !wts.is_empty());
+
+    // Sort by total (own + worktrees) descending
+    let mut sorted: Vec<(String, i64, Vec<(String, i64)>)> = projects
+        .into_iter()
+        .map(|(root, (own, wts))| {
+            let wt_total: i64 = wts.values().sum();
+            let total = own + wt_total;
+            let mut wt_sorted: Vec<(String, i64)> = wts.into_iter().collect();
+            wt_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            (root, total, wt_sorted)
+        })
+        .collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (root, total, worktrees) in &sorted {
+        fmt::write(
+            &mut out,
+            format_args!("  {:>6}  {}\n", format_number(*total), shorten_path(root, 60)),
+        )
+        .unwrap();
+        for (wt_name, count) in worktrees {
+            fmt::write(
+                &mut out,
+                format_args!("  {:>6}    \u{21b3} {}\n", format_number(*count), wt_name),
+            )
+            .unwrap();
+        }
     }
 
     out
@@ -1063,10 +1174,12 @@ mod tests {
         let section = format_models_section(&conn);
         assert!(section.contains("--- Models ---"));
         assert!(section.contains("claude-sonnet-4-20250514"));
-        assert!(section.contains("tokens"));
+        assert!(section.contains("in/out tokens"));
         assert!(section.contains("sessions"));
-        assert!(section.contains("API calls"));
+        assert!(!section.contains("API calls"));
         assert!(section.contains("\u{2588}"));
+        // Should show 1,500 (1000 input + 500 output, not including cache tokens)
+        assert!(section.contains("1,500"));
     }
 
     #[test]
@@ -1091,5 +1204,84 @@ mod tests {
         // Single model should not show per-model breakdown, just total
         assert!(!section.contains("Est. cost (claude-sonnet"));
         assert!(section.contains("Est. cost (total)"));
+    }
+
+    #[test]
+    fn extract_project_info_worktree_path() {
+        let (root, wt) = extract_project_info(
+            "/home/user/repos/myproject/.claude/worktrees/cool-feature/src/lib.rs",
+        );
+        assert_eq!(root, "/home/user/repos/myproject");
+        assert_eq!(wt, Some("cool-feature".to_string()));
+    }
+
+    #[test]
+    fn extract_project_info_worktree_root_no_subdir() {
+        let (root, wt) = extract_project_info(
+            "/home/user/repos/myproject/.claude/worktrees/cool-feature",
+        );
+        assert_eq!(root, "/home/user/repos/myproject");
+        assert_eq!(wt, Some("cool-feature".to_string()));
+    }
+
+    #[test]
+    fn extract_project_info_plain_path() {
+        let (root, wt) = extract_project_info("/home/user/repos/myproject");
+        assert_eq!(root, "/home/user/repos/myproject");
+        assert_eq!(wt, None);
+    }
+
+    #[test]
+    fn extract_project_info_worktrees_trailing_slash() {
+        let (root, wt) = extract_project_info(
+            "/home/user/repos/myproject/.claude/worktrees/",
+        );
+        assert_eq!(root, "/home/user/repos/myproject");
+        assert_eq!(wt, None);
+    }
+
+    #[test]
+    fn format_by_project_worktree_nesting() {
+        let conn = test_conn();
+        let base = "/home/user/repos/myproject";
+        let wt1 = format!("{}/.claude/worktrees/feature-a/src", base);
+        let wt2 = format!("{}/.claude/worktrees/feature-b", base);
+
+        // 3 tool uses in feature-a worktree, 2 in feature-b, 1 in repo root
+        for i in 0..3 {
+            db::insert_tool_use(&conn, &format!("a{i}"), "s1", "Read", "ts", &wt1, "{}").unwrap();
+        }
+        for i in 0..2 {
+            db::insert_tool_use(&conn, &format!("b{i}"), "s1", "Read", "ts", &wt2, "{}").unwrap();
+        }
+        db::insert_tool_use(&conn, "r1", "s1", "Read", "ts", base, "{}").unwrap();
+
+        let section = format_by_project_section(&conn);
+
+        // Total should be 6 (3 + 2 + 1)
+        assert!(section.contains("6"));
+        // Worktrees should appear with arrow prefix
+        assert!(section.contains("\u{21b3} feature-a"));
+        assert!(section.contains("\u{21b3} feature-b"));
+        // feature-a (3) should come before feature-b (2)
+        let a_pos = section.find("feature-a").unwrap();
+        let b_pos = section.find("feature-b").unwrap();
+        assert!(a_pos < b_pos);
+    }
+
+    #[test]
+    fn format_by_project_subdir_merging() {
+        let conn = test_conn();
+        // Tool uses in a subdirectory of a project
+        db::insert_tool_use(&conn, "t1", "s1", "Read", "ts", "/home/user/repos/proj", "{}").unwrap();
+        db::insert_tool_use(&conn, "t2", "s1", "Read", "ts", "/home/user/repos/proj/src", "{}").unwrap();
+
+        let section = format_by_project_section(&conn);
+
+        // Should show total of 2 for the project root, not separate entries
+        assert!(section.contains("2"));
+        // Should NOT show /src as a separate line
+        let lines: Vec<&str> = section.lines().filter(|l| l.contains("proj")).collect();
+        assert_eq!(lines.len(), 1);
     }
 }
