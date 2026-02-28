@@ -50,6 +50,7 @@ pub fn run() {
     }
 }
 
+#[cfg(not(tarpaulin_include))]
 fn try_run() -> Result<(), Box<dyn std::error::Error>> {
     let current_exe = std::env::current_exe()?;
     let dest_dir = install_dir()?;

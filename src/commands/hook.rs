@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use chrono::Utc;
@@ -318,46 +318,6 @@ pub fn parse_transcript_from_offset(path: &Path, start_offset: u64) -> (Aggregat
     (agg, offset)
 }
 
-/// Parse transcript from any BufRead source.
-#[cfg(test)]
-pub fn parse_transcript_reader(reader: impl BufRead) -> AggregatedTokenUsage {
-    let mut agg = AggregatedTokenUsage::default();
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.is_empty() {
-            continue;
-        }
-        let tl: TranscriptLine = match serde_json::from_str(&line) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        if tl.line_type.as_deref() != Some("assistant") {
-            continue;
-        }
-
-        if let Some(msg) = tl.message {
-            if let Some(model) = &msg.model {
-                if agg.model.is_empty() {
-                    agg.model = model.clone();
-                }
-            }
-            if let Some(usage) = msg.usage {
-                agg.input_tokens += usage.input_tokens.unwrap_or(0);
-                agg.output_tokens += usage.output_tokens.unwrap_or(0);
-                agg.cache_creation_tokens += usage.cache_creation_input_tokens.unwrap_or(0);
-                agg.cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0);
-                agg.api_call_count += 1;
-            }
-        }
-    }
-
-    agg
-}
 
 #[cfg(test)]
 mod tests {
@@ -703,53 +663,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.len(), 500);
         assert!(resp.ends_with("..."));
-    }
-
-    #[test]
-    fn parse_transcript_reader_skips_io_errors() {
-        /// A reader that yields one valid line, then an IO error, then another valid line.
-        struct FlakyReader {
-            calls: u8,
-        }
-
-        impl std::io::Read for FlakyReader {
-            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                unreachable!()
-            }
-        }
-
-        impl std::io::BufRead for FlakyReader {
-            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-                unreachable!()
-            }
-            fn consume(&mut self, _amt: usize) {}
-
-            fn read_line(&mut self, buf: &mut String) -> std::io::Result<usize> {
-                self.calls += 1;
-                match self.calls {
-                    1 => {
-                        let line = r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":10,"output_tokens":5}}}"#;
-                        let l = format!("{line}\n");
-                        buf.push_str(&l);
-                        Ok(l.len())
-                    }
-                    2 => Err(std::io::Error::new(std::io::ErrorKind::Other, "disk error")),
-                    3 => {
-                        let line = r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":20,"output_tokens":10}}}"#;
-                        let l = format!("{line}\n");
-                        buf.push_str(&l);
-                        Ok(l.len())
-                    }
-                    _ => Ok(0),
-                }
-            }
-        }
-
-        let reader = FlakyReader { calls: 0 };
-        let agg = parse_transcript_reader(reader);
-        assert_eq!(agg.api_call_count, 2);
-        assert_eq!(agg.input_tokens, 30);
-        assert_eq!(agg.output_tokens, 15);
     }
 
     // --- parse_transcript_from_offset tests ---
