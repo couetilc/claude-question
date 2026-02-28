@@ -162,13 +162,31 @@ fn format_models_section(conn: &Connection) -> String {
         out.push_str("  No model data recorded yet.\n");
     } else {
         let max_tokens = rows.first().map(|(_, _, t)| *t).unwrap_or(0);
-        let max_name_len = rows.iter().map(|(m, _, _)| m.len()).max().unwrap_or(0);
+        let max_name_len = rows.iter().map(|(m, _, _)| m.len()).max().unwrap_or(10);
+        fmt::write(
+            &mut out,
+            format_args!(
+                "  {:<width$}  {:>8}  {:>8}\n",
+                "Model", "I/O Toks", "Sessions",
+                width = max_name_len,
+            ),
+        )
+        .unwrap();
+        fmt::write(
+            &mut out,
+            format_args!(
+                "  {:<width$}  {:>8}  {:>8}\n",
+                "─".repeat(max_name_len), "────────", "────────",
+                width = max_name_len,
+            ),
+        )
+        .unwrap();
         for (model, sessions, tokens) in &rows {
             let bar = make_bar(*tokens, max_tokens, 20);
             fmt::write(
                 &mut out,
                 format_args!(
-                    "  {:<width$}  {:>8} in/out tokens  {:>4} sessions  {}\n",
+                    "  {:<width$}  {:>8}  {:>8}  {}\n",
                     model,
                     format_number(*tokens),
                     format_number(*sessions),
@@ -352,7 +370,19 @@ fn format_tool_usage_section(conn: &Connection) -> String {
         .collect();
     let max_count = rows.first().map(|(_, c)| *c).unwrap_or(0);
     // Find the longest tool name for padding
-    let max_name_len = rows.iter().map(|(t, _)| t.len()).max().unwrap_or(0);
+    let max_name_len = rows.iter().map(|(t, _)| t.len()).max().unwrap_or(4);
+    if !rows.is_empty() {
+        fmt::write(
+            &mut out,
+            format_args!("  {:>6}  {:<width$}\n", "Calls", "Tool", width = max_name_len),
+        )
+        .unwrap();
+        fmt::write(
+            &mut out,
+            format_args!("  {:>6}  {:<width$}\n", "──────", "─".repeat(max_name_len), width = max_name_len),
+        )
+        .unwrap();
+    }
     for (tool, count) in &rows {
         let bar = make_bar(*count, max_count, 20);
         fmt::write(
@@ -382,6 +412,10 @@ fn format_top_files_section(conn: &Connection) -> String {
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
+    if !rows.is_empty() {
+        fmt::write(&mut out, format_args!("  {:>6}  {}\n", "Reads", "File")).unwrap();
+        fmt::write(&mut out, format_args!("  {:>6}  {}\n", "──────", "────")).unwrap();
+    }
     for (path, count) in &rows {
         fmt::write(&mut out, format_args!("  {:>6}  {}\n", format_number(*count), shorten_path(path, 60))).unwrap();
     }
@@ -421,6 +455,10 @@ fn format_top_bash_section(conn: &Connection) -> String {
 
     let mut sorted: Vec<_> = cmd_counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    if !sorted.is_empty() {
+        fmt::write(&mut out, format_args!("  {:>6}  {}\n", "Runs", "Command")).unwrap();
+        fmt::write(&mut out, format_args!("  {:>6}  {}\n", "──────", "───────")).unwrap();
+    }
     for (cmd, count) in sorted.iter().take(10) {
         fmt::write(&mut out, format_args!("  {:>6}  {}\n", format_number(*count), cmd)).unwrap();
     }
@@ -445,6 +483,10 @@ fn format_activity_by_date_section(conn: &Connection) -> String {
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
+    if !rows.is_empty() {
+        fmt::write(&mut out, format_args!("  {}  {:>6}\n", "Date      ", "Calls")).unwrap();
+        fmt::write(&mut out, format_args!("  {}  {:>6}\n", "──────────", "──────")).unwrap();
+    }
     for (date, count) in &rows {
         fmt::write(&mut out, format_args!("  {}  {:>6}\n", date, format_number(*count))).unwrap();
     }
@@ -569,6 +611,10 @@ fn format_by_project_section(conn: &Connection) -> String {
         .collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
 
+    if !sorted.is_empty() {
+        fmt::write(&mut out, format_args!("  {:>6}  {}\n", "Calls", "Project")).unwrap();
+        fmt::write(&mut out, format_args!("  {:>6}  {}\n", "──────", "───────")).unwrap();
+    }
     for (root, total, worktrees) in &sorted {
         fmt::write(
             &mut out,
@@ -1228,8 +1274,9 @@ mod tests {
         let section = format_models_section(&conn);
         assert!(section.contains("--- Models ---"));
         assert!(section.contains("claude-sonnet-4-20250514"));
-        assert!(section.contains("in/out tokens"));
-        assert!(section.contains("sessions"));
+        assert!(section.contains("I/O Toks"));
+        assert!(section.contains("Sessions"));
+        assert!(section.contains("─"));
         assert!(!section.contains("API calls"));
         assert!(section.contains("\u{2588}"));
         // Should show 1,500 (1000 input + 500 output, not including cache tokens)
