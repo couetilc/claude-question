@@ -30,22 +30,21 @@ fn cli_help_flag() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Claude Code tool usage tracker"));
-    assert!(stdout.contains("log"));
+    assert!(stdout.contains("Claude Code usage analytics tracker"));
+    assert!(stdout.contains("hook"));
     assert!(stdout.contains("stats"));
     assert!(stdout.contains("install"));
     assert!(stdout.contains("uninstall"));
+    assert!(stdout.contains("migrate"));
+    assert!(stdout.contains("query"));
 }
 
 #[test]
-fn cli_log_subcommand_with_valid_json() {
-    let input = r#"{"tool_name":"Read","session_id":"s1","cwd":"/tmp","tool_input":{"file_path":"/foo"}}"#;
+fn cli_hook_subcommand_with_valid_json() {
+    let input = r#"{"hook_event_name":"PostToolUse","tool_name":"Read","session_id":"s1","cwd":"/tmp","tool_input":{"file_path":"/foo"}}"#;
 
-    // We can't easily override the log path for the real binary,
-    // but we can at least verify it doesn't crash with valid JSON on stdin.
-    // The log subcommand always exits 0.
     let output = Command::new(binary_path())
-        .arg("log")
+        .arg("hook")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -59,14 +58,14 @@ fn cli_log_subcommand_with_valid_json() {
         })
         .expect("failed to run binary");
 
-    // Log always exits 0
+    // Hook always exits 0
     assert!(output.status.success());
 }
 
 #[test]
-fn cli_log_subcommand_with_invalid_json() {
+fn cli_hook_subcommand_with_invalid_json() {
     let output = Command::new(binary_path())
-        .arg("log")
+        .arg("hook")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -83,12 +82,12 @@ fn cli_log_subcommand_with_invalid_json() {
     // Still exits 0 — hook must not block
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("claude-track log:"));
+    assert!(stderr.contains("claude-track hook:"));
 }
 
 #[test]
 fn cli_stats_subcommand_runs() {
-    // Stats reads from ~/.claude/tool-usage.jsonl — it may or may not exist.
+    // Stats reads from ~/.claude/claude-track.db — it may or may not exist.
     // Either way it should exit 0.
     let output = Command::new(binary_path())
         .arg("stats")
@@ -97,9 +96,9 @@ fn cli_stats_subcommand_runs() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Should show either "No tool usage data yet." or the stats header
+    // Should show either "No tracking data yet" or the stats header
     assert!(
-        stdout.contains("No tool usage data yet.") || stdout.contains("Claude Code Tool Usage Stats")
+        stdout.contains("No tracking data yet") || stdout.contains("Claude Code Usage Stats")
     );
 }
 
@@ -115,7 +114,7 @@ fn cli_invalid_subcommand() {
 
 #[test]
 fn cli_install_subcommand_runs() {
-    // Install will either add the hook or say "already installed".
+    // Install will either add the hooks or say "already installed".
     // Either way it should exit 0.
     let output = Command::new(binary_path())
         .arg("install")
@@ -131,8 +130,8 @@ fn cli_install_subcommand_runs() {
 
 #[test]
 fn cli_uninstall_subcommand_runs() {
-    // Uninstall with empty stdin — will remove hook (or say not found)
-    // and skip log deletion prompt (EOF = no).
+    // Uninstall with empty stdin — will remove hooks (or say not found)
+    // and skip data deletion prompts (EOF = no).
     let output = Command::new(binary_path())
         .arg("uninstall")
         .stdin(std::process::Stdio::piped())
@@ -140,7 +139,7 @@ fn cli_uninstall_subcommand_runs() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .and_then(|mut child| {
-            // Close stdin immediately (EOF = answer "no" to delete prompt)
+            // Close stdin immediately (EOF = answer "no" to delete prompts)
             drop(child.stdin.take());
             child.wait_with_output()
         })
@@ -149,4 +148,33 @@ fn cli_uninstall_subcommand_runs() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Uninstalled successfully."));
+}
+
+#[test]
+fn cli_migrate_subcommand_runs() {
+    let output = Command::new(binary_path())
+        .arg("migrate")
+        .output()
+        .expect("failed to run binary");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Either migrates data or says no file found
+    assert!(
+        stdout.contains("Migrated") || stdout.contains("No JSONL file found") || stdout.contains("Nothing to migrate")
+    );
+}
+
+#[test]
+fn cli_query_subcommand_runs() {
+    let output = Command::new(binary_path())
+        .arg("query")
+        .arg("SELECT 1 as test")
+        .output()
+        .expect("failed to run binary");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("test"));
+    assert!(stdout.contains("1"));
 }

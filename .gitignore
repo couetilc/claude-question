@@ -2,3 +2,4 @@
 .entire
 /target
 .claude/
+*.profraw
