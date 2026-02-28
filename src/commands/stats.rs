@@ -145,14 +145,14 @@ fn format_models_section(conn: &Connection) -> String {
 
     let mut stmt = conn
         .prepare(
-            "SELECT model, COUNT(DISTINCT session_id) as sessions,
+            "SELECT model, COUNT(DISTINCT session_id) as sessions, COUNT(*) as api_calls,
                     SUM(input_tokens + cache_creation_tokens + cache_read_tokens + output_tokens) as total_tokens
              FROM token_usage WHERE model IS NOT NULL AND model != ''
              GROUP BY model ORDER BY total_tokens DESC",
         )
         .unwrap();
-    let rows: Vec<(String, i64, i64)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    let rows: Vec<(String, i64, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
@@ -160,17 +160,18 @@ fn format_models_section(conn: &Connection) -> String {
     if rows.is_empty() {
         out.push_str("  No model data recorded yet.\n");
     } else {
-        let max_tokens = rows.first().map(|(_, _, t)| *t).unwrap_or(0);
-        let max_name_len = rows.iter().map(|(m, _, _)| m.len()).max().unwrap_or(0);
-        for (model, sessions, tokens) in &rows {
+        let max_tokens = rows.first().map(|(_, _, _, t)| *t).unwrap_or(0);
+        let max_name_len = rows.iter().map(|(m, _, _, _)| m.len()).max().unwrap_or(0);
+        for (model, sessions, api_calls, tokens) in &rows {
             let bar = make_bar(*tokens, max_tokens, 20);
             fmt::write(
                 &mut out,
                 format_args!(
-                    "  {:<width$}  {:>8} tokens  {:>4} sessions  {}\n",
+                    "  {:<width$}  {:>8} tokens  {:>4} sessions  {:>6} API calls  {}\n",
                     model,
                     format_number(*tokens),
                     format_number(*sessions),
+                    format_number(*api_calls),
                     bar,
                     width = max_name_len,
                 ),
@@ -1064,6 +1065,7 @@ mod tests {
         assert!(section.contains("claude-sonnet-4-20250514"));
         assert!(section.contains("tokens"));
         assert!(section.contains("sessions"));
+        assert!(section.contains("API calls"));
         assert!(section.contains("\u{2588}"));
     }
 
