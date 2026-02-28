@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn query_integer_values() {
         let conn = test_conn();
-        db::insert_token_usage(&conn, "s1", "ts", "model", 100, 200, 300, 50, 3).unwrap();
+        db::insert_token_usage(&conn, "s1", "ts", "model", 100, 200, 300, 50, 3, 0).unwrap();
         let output = execute_query(&conn, "SELECT input_tokens FROM token_usage").unwrap();
         assert!(output.contains("100"));
     }

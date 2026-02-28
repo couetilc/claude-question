@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use chrono::Utc;
@@ -95,17 +95,64 @@ fn handle_stop(
         .or_else(|| db::get_transcript_path(conn, session_id).ok().flatten());
 
     if let Some(path) = transcript_path {
-        let agg = parse_transcript(Path::new(&path));
+        let path = Path::new(&path);
+
+        // Get current DB state (or defaults)
+        let (cur_input, cur_cc, cur_cr, cur_output, cur_calls, cur_offset, cur_model) =
+            db::get_session_token_state(conn, session_id)?
+                .unwrap_or((0, 0, 0, 0, 0, 0, String::new()));
+
+        // Check for file shrink
+        let file_len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let effective_offset = if (cur_offset as u64) > file_len {
+            0
+        } else {
+            cur_offset as u64
+        };
+
+        // Parse only new content
+        let (delta, new_offset) = parse_transcript_from_offset(path, effective_offset);
+
+        // Determine final values
+        let (new_input, new_cc, new_cr, new_output, new_calls) =
+            if effective_offset == 0 && cur_offset > 0 {
+                // File shrank: delta IS cumulative, don't add to existing
+                (
+                    delta.input_tokens,
+                    delta.cache_creation_tokens,
+                    delta.cache_read_tokens,
+                    delta.output_tokens,
+                    delta.api_call_count,
+                )
+            } else {
+                // Normal: add delta to existing
+                (
+                    cur_input + delta.input_tokens,
+                    cur_cc + delta.cache_creation_tokens,
+                    cur_cr + delta.cache_read_tokens,
+                    cur_output + delta.output_tokens,
+                    cur_calls + delta.api_call_count,
+                )
+            };
+
+        // Use existing model if delta didn't find one
+        let model = if delta.model.is_empty() {
+            &cur_model
+        } else {
+            &delta.model
+        };
+
         db::insert_token_usage(
             conn,
             session_id,
             now,
-            &agg.model,
-            agg.input_tokens,
-            agg.cache_creation_tokens,
-            agg.cache_read_tokens,
-            agg.output_tokens,
-            agg.api_call_count,
+            model,
+            new_input,
+            new_cc,
+            new_cr,
+            new_output,
+            new_calls,
+            new_offset as i64,
         )?;
     }
     Ok(())
@@ -175,16 +222,104 @@ fn truncate_response(value: &serde_json::Value) -> String {
     }
 }
 
-/// Parse a transcript JSONL file and aggregate token usage.
+/// Parse a transcript JSONL file and aggregate token usage (full parse from start).
+#[cfg(test)]
 pub fn parse_transcript(path: &Path) -> AggregatedTokenUsage {
-    let file = match fs::File::open(path) {
+    parse_transcript_from_offset(path, 0).0
+}
+
+/// Parse a transcript JSONL file starting from `start_offset` bytes.
+/// Returns `(delta_usage, new_offset)` where `new_offset` is the byte position
+/// after the last successfully parsed line.
+pub fn parse_transcript_from_offset(path: &Path, start_offset: u64) -> (AggregatedTokenUsage, u64) {
+    let mut file = match fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return AggregatedTokenUsage::default(),
+        Err(_) => return (AggregatedTokenUsage::default(), start_offset),
     };
-    parse_transcript_reader(BufReader::new(file))
+
+    let file_len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return (AggregatedTokenUsage::default(), start_offset),
+    };
+
+    // If file shrank, caller handles reset; we just parse from the given offset
+    if start_offset >= file_len {
+        return (AggregatedTokenUsage::default(), start_offset);
+    }
+
+    if start_offset > 0 {
+        if file.seek(SeekFrom::Start(start_offset)).is_err() {
+            return (AggregatedTokenUsage::default(), start_offset);
+        }
+    }
+
+    let mut remaining = String::new();
+    if BufReader::new(&mut file).read_to_string(&mut remaining).is_err() {
+        return (AggregatedTokenUsage::default(), start_offset);
+    }
+
+    let mut agg = AggregatedTokenUsage::default();
+    let mut offset = start_offset;
+    let remaining_bytes = remaining.as_bytes();
+    let mut pos = 0;
+
+    while pos < remaining_bytes.len() {
+        // Find next newline
+        let line_end = remaining_bytes[pos..].iter().position(|&b| b == b'\n');
+
+        let (line_str, next_pos, has_newline) = match line_end {
+            Some(end) => (&remaining[pos..pos + end], pos + end + 1, true),
+            None => (&remaining[pos..], remaining_bytes.len(), false),
+        };
+
+        if line_str.is_empty() {
+            pos = next_pos;
+            offset = start_offset + pos as u64;
+            continue;
+        }
+
+        match serde_json::from_str::<TranscriptLine>(line_str) {
+            Ok(tl) => {
+                pos = next_pos;
+                offset = start_offset + pos as u64;
+
+                if tl.line_type.as_deref() != Some("assistant") {
+                    continue;
+                }
+
+                if let Some(msg) = tl.message {
+                    if let Some(model) = &msg.model {
+                        if agg.model.is_empty() {
+                            agg.model = model.clone();
+                        }
+                    }
+                    if let Some(usage) = msg.usage {
+                        agg.input_tokens += usage.input_tokens.unwrap_or(0);
+                        agg.output_tokens += usage.output_tokens.unwrap_or(0);
+                        agg.cache_creation_tokens +=
+                            usage.cache_creation_input_tokens.unwrap_or(0);
+                        agg.cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0);
+                        agg.api_call_count += 1;
+                    }
+                }
+            }
+            Err(_) => {
+                if !has_newline {
+                    // Partial line at EOF — don't advance offset
+                    break;
+                }
+                // Complete line but invalid JSON — skip it
+                pos = next_pos;
+                offset = start_offset + pos as u64;
+            }
+        }
+    }
+
+    (agg, offset)
 }
 
 /// Parse transcript from any BufRead source.
+#[cfg(test)]
 pub fn parse_transcript_reader(reader: impl BufRead) -> AggregatedTokenUsage {
     let mut agg = AggregatedTokenUsage::default();
 
@@ -615,5 +750,403 @@ mod tests {
         assert_eq!(agg.api_call_count, 2);
         assert_eq!(agg.input_tokens, 30);
         assert_eq!(agg.output_tokens, 15);
+    }
+
+    // --- parse_transcript_from_offset tests ---
+
+    fn assistant_line(input_tokens: i64, output_tokens: i64) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"model":"claude-sonnet-4-20250514","usage":{{"input_tokens":{},"output_tokens":{}}}}}}}"#,
+            input_tokens, output_tokens
+        )
+    }
+
+    fn assistant_line_with_cache(input: i64, output: i64, cc: i64, cr: i64) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"model":"claude-sonnet-4-20250514","usage":{{"input_tokens":{},"output_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{}}}}}}}"#,
+            input, output, cc, cr
+        )
+    }
+
+    #[test]
+    fn incremental_parse_two_stages() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        // Write 2 lines
+        let line1 = assistant_line(100, 50);
+        let line2 = assistant_line(150, 75);
+        let content = format!("{line1}\n{line2}\n");
+        fs::write(&path, &content).unwrap();
+
+        // Parse from 0
+        let (agg1, offset1) = parse_transcript_from_offset(&path, 0);
+        assert_eq!(agg1.input_tokens, 250);
+        assert_eq!(agg1.output_tokens, 125);
+        assert_eq!(agg1.api_call_count, 2);
+        assert_eq!(offset1 as usize, content.len());
+
+        // Append 2 more lines
+        let line3 = assistant_line(200, 100);
+        let line4 = assistant_line(50, 25);
+        let extra = format!("{line3}\n{line4}\n");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut file, extra.as_bytes()).unwrap();
+
+        // Parse from previous offset — should only get delta
+        let (agg2, offset2) = parse_transcript_from_offset(&path, offset1);
+        assert_eq!(agg2.input_tokens, 250); // 200 + 50
+        assert_eq!(agg2.output_tokens, 125); // 100 + 25
+        assert_eq!(agg2.api_call_count, 2);
+        assert_eq!(offset2 as usize, content.len() + extra.len());
+    }
+
+    #[test]
+    fn offset_file_shrink_resets_to_zero() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let line = assistant_line(10, 5);
+        fs::write(&path, format!("{line}\n")).unwrap();
+
+        // Parse from offset larger than file size
+        let (agg, new_offset) = parse_transcript_from_offset(&path, 99999);
+        assert_eq!(agg.api_call_count, 0);
+        assert_eq!(new_offset, 99999); // returns start_offset unchanged
+    }
+
+    #[test]
+    fn offset_no_new_data() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let line = assistant_line(10, 5);
+        let content = format!("{line}\n");
+        fs::write(&path, &content).unwrap();
+
+        // Parse from offset == file length
+        let (agg, new_offset) = parse_transcript_from_offset(&path, content.len() as u64);
+        assert_eq!(agg.api_call_count, 0);
+        assert_eq!(agg.input_tokens, 0);
+        assert_eq!(new_offset, content.len() as u64);
+    }
+
+    #[test]
+    fn partial_line_at_eof_not_advanced() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let line1 = assistant_line(100, 50);
+        let partial = r#"{"type":"assistant","message":{"model":"m","usage":{"#;
+        // First line has trailing newline, partial line does NOT
+        let content = format!("{line1}\n{partial}");
+        fs::write(&path, &content).unwrap();
+
+        let (agg, new_offset) = parse_transcript_from_offset(&path, 0);
+        assert_eq!(agg.api_call_count, 1);
+        assert_eq!(agg.input_tokens, 100);
+        // Offset should be just past line1's newline, not past the partial
+        assert_eq!(new_offset as usize, line1.len() + 1);
+    }
+
+    #[test]
+    fn missing_file_returns_default() {
+        let (agg, offset) = parse_transcript_from_offset(Path::new("/nonexistent/path.jsonl"), 42);
+        assert_eq!(agg.api_call_count, 0);
+        assert_eq!(agg.model, "");
+        assert_eq!(offset, 42); // start_offset unchanged
+    }
+
+    #[test]
+    fn parse_transcript_wrapper_full_cumulative() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let line1 = assistant_line(100, 50);
+        let line2 = assistant_line(200, 100);
+        fs::write(&path, format!("{line1}\n{line2}\n")).unwrap();
+
+        let agg = parse_transcript(&path);
+        assert_eq!(agg.input_tokens, 300);
+        assert_eq!(agg.output_tokens, 150);
+        assert_eq!(agg.api_call_count, 2);
+    }
+
+    // --- Risk condition tests ---
+
+    #[test]
+    fn risk1_file_truncation_rewrite() {
+        // DB has offset=500 and accumulated tokens, but file is now 100 bytes.
+        // handle_stop should detect shrink, re-parse from 0, and replace (not add to) existing values.
+        let dir = TempDir::new().unwrap();
+        let transcript_path = dir.path().join("transcript.jsonl");
+        let conn = test_conn();
+
+        // Initial transcript and stop
+        let line1 = assistant_line(100, 50);
+        let line2 = assistant_line(200, 100);
+        let content = format!("{line1}\n{line2}\n");
+        fs::write(&transcript_path, &content).unwrap();
+
+        let json = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s1","transcript_path":"{}"}}"#,
+            transcript_path.display()
+        );
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        // Verify first stop
+        let (inp, out, calls): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, api_call_count FROM token_usage WHERE session_id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(inp, 300);
+        assert_eq!(out, 150);
+        assert_eq!(calls, 2);
+
+        // Simulate file truncation/rewrite with smaller content
+        let new_line = assistant_line(10, 5);
+        fs::write(&transcript_path, format!("{new_line}\n")).unwrap();
+
+        // Second stop — file has shrunk
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        let (inp2, out2, calls2): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, api_call_count FROM token_usage WHERE session_id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        // Should be the new file's values, NOT 300+10
+        assert_eq!(inp2, 10);
+        assert_eq!(out2, 5);
+        assert_eq!(calls2, 1);
+    }
+
+    #[test]
+    fn risk2_partial_last_line_at_eof() {
+        // Transcript with incomplete JSON line at end. Parser should not advance
+        // offset past it, so the next Stop re-reads the now-complete line.
+        let dir = TempDir::new().unwrap();
+        let transcript_path = dir.path().join("transcript.jsonl");
+        let conn = test_conn();
+
+        let line1 = assistant_line(100, 50);
+        let partial = r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":200,"output_tokens":100"#;
+        fs::write(&transcript_path, format!("{line1}\n{partial}")).unwrap();
+
+        let json = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s1","transcript_path":"{}"}}"#,
+            transcript_path.display()
+        );
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        // Should only see line1
+        let (inp, calls): (i64, i64) = conn
+            .query_row(
+                "SELECT input_tokens, api_call_count FROM token_usage WHERE session_id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(inp, 100);
+        assert_eq!(calls, 1);
+
+        // Now complete the partial line
+        let completed_line = r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":200,"output_tokens":100}}}"#;
+        fs::write(&transcript_path, format!("{line1}\n{completed_line}\n")).unwrap();
+
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        // Should now include both lines
+        let (inp2, calls2): (i64, i64) = conn
+            .query_row(
+                "SELECT input_tokens, api_call_count FROM token_usage WHERE session_id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(inp2, 300);
+        assert_eq!(calls2, 2);
+    }
+
+    #[test]
+    fn risk4_accumulation_correctness_three_stages() {
+        // Write a known transcript, parse in 3 stages (simulating 3 stops),
+        // verify final DB totals exactly match a single full parse.
+        let dir = TempDir::new().unwrap();
+        let transcript_path = dir.path().join("transcript.jsonl");
+        let conn = test_conn();
+
+        let lines = vec![
+            assistant_line_with_cache(100, 50, 10, 20),
+            assistant_line_with_cache(200, 100, 30, 40),
+            assistant_line_with_cache(300, 150, 50, 60),
+            assistant_line_with_cache(400, 200, 70, 80),
+            assistant_line_with_cache(500, 250, 90, 100),
+            assistant_line_with_cache(600, 300, 110, 120),
+        ];
+
+        let json = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s1","transcript_path":"{}"}}"#,
+            transcript_path.display()
+        );
+
+        // Stage 1: first 2 lines
+        fs::write(&transcript_path, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        // Stage 2: append 2 more lines
+        let mut file = fs::OpenOptions::new().append(true).open(&transcript_path).unwrap();
+        std::io::Write::write_all(&mut file, format!("{}\n{}\n", lines[2], lines[3]).as_bytes()).unwrap();
+        drop(file);
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        // Stage 3: append final 2 lines
+        let mut file = fs::OpenOptions::new().append(true).open(&transcript_path).unwrap();
+        std::io::Write::write_all(&mut file, format!("{}\n{}\n", lines[4], lines[5]).as_bytes()).unwrap();
+        drop(file);
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        // Verify final DB values
+        let (inp, out, cc, cr, calls): (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, api_call_count FROM token_usage WHERE session_id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+
+        // Compare against a single full parse
+        let full_agg = parse_transcript(&transcript_path);
+        assert_eq!(inp, full_agg.input_tokens);
+        assert_eq!(out, full_agg.output_tokens);
+        assert_eq!(cc, full_agg.cache_creation_tokens);
+        assert_eq!(cr, full_agg.cache_read_tokens);
+        assert_eq!(calls, full_agg.api_call_count);
+
+        // Also verify exact expected values
+        assert_eq!(inp, 2100); // 100+200+300+400+500+600
+        assert_eq!(out, 1050); // 50+100+150+200+250+300
+        assert_eq!(cc, 360);   // 10+30+50+70+90+110
+        assert_eq!(cr, 420);   // 20+40+60+80+100+120
+        assert_eq!(calls, 6);
+    }
+
+    #[test]
+    fn model_preserved_across_incremental_parses() {
+        // First stop finds model in assistant messages.
+        // Subsequent stops parse only new non-assistant lines (no model).
+        // Existing model should be preserved.
+        let dir = TempDir::new().unwrap();
+        let transcript_path = dir.path().join("transcript.jsonl");
+        let conn = test_conn();
+
+        let line1 = assistant_line(100, 50);
+        fs::write(&transcript_path, format!("{line1}\n")).unwrap();
+
+        let json = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s1","transcript_path":"{}"}}"#,
+            transcript_path.display()
+        );
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        let model1: String = conn
+            .query_row("SELECT model FROM token_usage WHERE session_id='s1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(model1, "claude-sonnet-4-20250514");
+
+        // Append a user line (no model info)
+        let mut file = fs::OpenOptions::new().append(true).open(&transcript_path).unwrap();
+        std::io::Write::write_all(&mut file, b"{\"type\":\"user\",\"message\":{}}\n").unwrap();
+        drop(file);
+
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        // Model should be preserved
+        let model2: String = conn
+            .query_row("SELECT model FROM token_usage WHERE session_id='s1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(model2, "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn three_consecutive_stops_offset_advances() {
+        // Full cycle: 3 consecutive Stop events with growing transcript.
+        // After each stop, verify DB has correct cumulative totals and offset advances.
+        let dir = TempDir::new().unwrap();
+        let transcript_path = dir.path().join("transcript.jsonl");
+        let conn = test_conn();
+
+        let json = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s1","transcript_path":"{}"}}"#,
+            transcript_path.display()
+        );
+
+        // Stop 1
+        let line1 = assistant_line(100, 50);
+        fs::write(&transcript_path, format!("{line1}\n")).unwrap();
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        let (inp, out, calls, offset): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, api_call_count, last_transcript_offset FROM token_usage WHERE session_id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(inp, 100);
+        assert_eq!(out, 50);
+        assert_eq!(calls, 1);
+        let offset1 = offset;
+        assert!(offset1 > 0);
+
+        // Stop 2
+        let line2 = assistant_line(200, 100);
+        let mut file = fs::OpenOptions::new().append(true).open(&transcript_path).unwrap();
+        std::io::Write::write_all(&mut file, format!("{line2}\n").as_bytes()).unwrap();
+        drop(file);
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        let (inp, out, calls, offset): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, api_call_count, last_transcript_offset FROM token_usage WHERE session_id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(inp, 300);
+        assert_eq!(out, 150);
+        assert_eq!(calls, 2);
+        let offset2 = offset;
+        assert!(offset2 > offset1);
+
+        // Stop 3
+        let line3 = assistant_line(300, 150);
+        let mut file = fs::OpenOptions::new().append(true).open(&transcript_path).unwrap();
+        std::io::Write::write_all(&mut file, format!("{line3}\n").as_bytes()).unwrap();
+        drop(file);
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        let (inp, out, calls, offset): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, api_call_count, last_transcript_offset FROM token_usage WHERE session_id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(inp, 600);
+        assert_eq!(out, 300);
+        assert_eq!(calls, 3);
+        assert!(offset > offset2);
+
+        // Verify exactly one token_usage row
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM token_usage WHERE session_id='s1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

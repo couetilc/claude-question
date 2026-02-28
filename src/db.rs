@@ -62,6 +62,10 @@ pub fn init_db(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
             api_call_count          INTEGER DEFAULT 0
         );",
     )?;
+    // Migration: add last_transcript_offset column (ignore error if it already exists)
+    let _ = conn.execute_batch(
+        "ALTER TABLE token_usage ADD COLUMN last_transcript_offset INTEGER DEFAULT 0;",
+    );
     Ok(())
 }
 
@@ -162,6 +166,32 @@ pub fn insert_prompt(
     Ok(())
 }
 
+/// Get current token state and offset for a session. Returns None if no row exists.
+/// Returns: (input_tokens, cache_creation, cache_read, output_tokens, api_call_count, last_transcript_offset, model)
+pub fn get_session_token_state(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<(i64, i64, i64, i64, i64, i64, String)>, Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT input_tokens, cache_creation_tokens, cache_read_tokens, output_tokens, api_call_count, last_transcript_offset, model
+         FROM token_usage WHERE session_id = ?1",
+    )?;
+    let result = stmt
+        .query_row(params![session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .ok();
+    Ok(result)
+}
+
 /// Upsert a token usage record. If a row already exists for this session_id,
 /// update it with the new cumulative totals. Otherwise insert a new row.
 /// This ensures only one token_usage row per session.
@@ -175,12 +205,13 @@ pub fn insert_token_usage(
     cache_read_tokens: i64,
     output_tokens: i64,
     api_call_count: i64,
+    last_transcript_offset: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rows = conn.execute(
         "UPDATE token_usage SET timestamp = ?1, model = ?2, input_tokens = ?3,
             cache_creation_tokens = ?4, cache_read_tokens = ?5,
-            output_tokens = ?6, api_call_count = ?7
-         WHERE session_id = ?8",
+            output_tokens = ?6, api_call_count = ?7, last_transcript_offset = ?8
+         WHERE session_id = ?9",
         params![
             timestamp,
             model,
@@ -189,13 +220,14 @@ pub fn insert_token_usage(
             cache_read_tokens,
             output_tokens,
             api_call_count,
+            last_transcript_offset,
             session_id,
         ],
     )?;
     if rows == 0 {
         conn.execute(
-            "INSERT INTO token_usage (session_id, timestamp, model, input_tokens, cache_creation_tokens, cache_read_tokens, output_tokens, api_call_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO token_usage (session_id, timestamp, model, input_tokens, cache_creation_tokens, cache_read_tokens, output_tokens, api_call_count, last_transcript_offset)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 session_id,
                 timestamp,
@@ -205,6 +237,7 @@ pub fn insert_token_usage(
                 cache_read_tokens,
                 output_tokens,
                 api_call_count,
+                last_transcript_offset,
             ],
         )?;
     }
@@ -393,7 +426,7 @@ mod tests {
     #[test]
     fn token_usage_insert() {
         let conn = mem_db();
-        insert_token_usage(&conn, "s1", "ts1", "claude-sonnet-4-20250514", 100, 200, 300, 50, 1).unwrap();
+        insert_token_usage(&conn, "s1", "ts1", "claude-sonnet-4-20250514", 100, 200, 300, 50, 1, 0).unwrap();
         let (model, inp, cc, cr, out, calls): (String, i64, i64, i64, i64, i64) = conn
             .query_row(
                 "SELECT model, input_tokens, cache_creation_tokens, cache_read_tokens, output_tokens, api_call_count FROM token_usage WHERE session_id='s1'",
@@ -412,9 +445,9 @@ mod tests {
     #[test]
     fn token_usage_upsert_replaces_existing() {
         let conn = mem_db();
-        insert_token_usage(&conn, "s1", "ts1", "claude-sonnet-4-20250514", 100, 200, 300, 50, 1).unwrap();
+        insert_token_usage(&conn, "s1", "ts1", "claude-sonnet-4-20250514", 100, 200, 300, 50, 1, 0).unwrap();
         // Second call with same session_id should update, not insert
-        insert_token_usage(&conn, "s1", "ts2", "claude-sonnet-4-20250514", 250, 400, 600, 125, 3).unwrap();
+        insert_token_usage(&conn, "s1", "ts2", "claude-sonnet-4-20250514", 250, 400, 600, 125, 3, 500).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM token_usage WHERE session_id='s1'", [], |row| row.get(0))
@@ -503,8 +536,8 @@ mod tests {
     #[test]
     fn dedup_token_usage_keeps_distinct_sessions() {
         let conn = mem_db();
-        insert_token_usage(&conn, "s1", "ts1", "claude-sonnet-4-20250514", 100, 200, 300, 50, 1).unwrap();
-        insert_token_usage(&conn, "s2", "ts2", "claude-opus-4-20250514", 500, 0, 0, 200, 3).unwrap();
+        insert_token_usage(&conn, "s1", "ts1", "claude-sonnet-4-20250514", 100, 200, 300, 50, 1, 0).unwrap();
+        insert_token_usage(&conn, "s2", "ts2", "claude-opus-4-20250514", 500, 0, 0, 200, 3, 0).unwrap();
 
         let removed = dedup_token_usage(&conn).unwrap();
         assert_eq!(removed, 0);
@@ -513,6 +546,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM token_usage", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn get_session_token_state_returns_none_for_missing() {
+        let conn = mem_db();
+        let result = get_session_token_state(&conn, "no_such_session").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_session_token_state_returns_values_and_offset() {
+        let conn = mem_db();
+        insert_token_usage(&conn, "s1", "ts1", "m", 100, 200, 300, 50, 2, 1234).unwrap();
+        let (inp, cc, cr, out, calls, offset, model) =
+            get_session_token_state(&conn, "s1").unwrap().unwrap();
+        assert_eq!(inp, 100);
+        assert_eq!(cc, 200);
+        assert_eq!(cr, 300);
+        assert_eq!(out, 50);
+        assert_eq!(calls, 2);
+        assert_eq!(offset, 1234);
+        assert_eq!(model, "m");
+    }
+
+    #[test]
+    fn insert_token_usage_stores_and_updates_offset() {
+        let conn = mem_db();
+        insert_token_usage(&conn, "s1", "ts1", "m", 10, 0, 0, 5, 1, 100).unwrap();
+        let (_, _, _, _, _, offset, _) = get_session_token_state(&conn, "s1").unwrap().unwrap();
+        assert_eq!(offset, 100);
+
+        // Upsert with new offset
+        insert_token_usage(&conn, "s1", "ts2", "m", 20, 0, 0, 10, 2, 250).unwrap();
+        let (_, _, _, _, _, offset, _) = get_session_token_state(&conn, "s1").unwrap().unwrap();
+        assert_eq!(offset, 250);
     }
 
     #[test]

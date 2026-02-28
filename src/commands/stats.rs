@@ -933,6 +933,7 @@ mod tests {
             3000,
             500,
             5,
+            0,
         )
         .unwrap();
 
@@ -1270,7 +1271,7 @@ mod tests {
     #[test]
     fn format_models_section_with_data() {
         let conn = test_conn();
-        db::insert_token_usage(&conn, "s1", "ts", "claude-sonnet-4-20250514", 1000, 0, 0, 500, 1).unwrap();
+        db::insert_token_usage(&conn, "s1", "ts", "claude-sonnet-4-20250514", 1000, 0, 0, 500, 1, 0).unwrap();
         let section = format_models_section(&conn);
         assert!(section.contains("--- Models ---"));
         assert!(section.contains("claude-sonnet-4-20250514"));
@@ -1286,8 +1287,8 @@ mod tests {
     #[test]
     fn format_tokens_section_multi_model_cost() {
         let conn = test_conn();
-        db::insert_token_usage(&conn, "s1", "ts", "claude-sonnet-4-20250514", 1_000_000, 0, 0, 0, 1).unwrap();
-        db::insert_token_usage(&conn, "s2", "ts", "claude-opus-4-20250514", 1_000_000, 0, 0, 0, 1).unwrap();
+        db::insert_token_usage(&conn, "s1", "ts", "claude-sonnet-4-20250514", 1_000_000, 0, 0, 0, 1, 0).unwrap();
+        db::insert_token_usage(&conn, "s2", "ts", "claude-opus-4-20250514", 1_000_000, 0, 0, 0, 1, 0).unwrap();
 
         let section = format_tokens_section(&conn);
         // Should show per-model costs when multiple models exist
@@ -1299,7 +1300,7 @@ mod tests {
     #[test]
     fn format_tokens_section_single_model_no_breakdown() {
         let conn = test_conn();
-        db::insert_token_usage(&conn, "s1", "ts", "claude-sonnet-4-20250514", 1000, 0, 0, 500, 1).unwrap();
+        db::insert_token_usage(&conn, "s1", "ts", "claude-sonnet-4-20250514", 1000, 0, 0, 500, 1, 0).unwrap();
 
         let section = format_tokens_section(&conn);
         // Single model should not show per-model breakdown, just total
