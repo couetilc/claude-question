@@ -50,6 +50,9 @@ pub fn format_report(conn: &Connection, file_size: u64, db_path: &Path) -> Strin
     // --- Sessions ---
     out.push_str(&format_sessions_section(conn));
 
+    // --- Models ---
+    out.push_str(&format_models_section(conn));
+
     // --- Token Usage ---
     out.push_str(&format_tokens_section(conn));
 
@@ -136,6 +139,50 @@ fn format_sessions_section(conn: &Connection) -> String {
     out
 }
 
+fn format_models_section(conn: &Connection) -> String {
+    let mut out = String::new();
+    out.push_str("--- Models ---\n");
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT model, COUNT(*) as sessions,
+                    SUM(input_tokens + cache_creation_tokens + cache_read_tokens + output_tokens) as total_tokens
+             FROM token_usage WHERE model IS NOT NULL AND model != ''
+             GROUP BY model ORDER BY total_tokens DESC",
+        )
+        .unwrap();
+    let rows: Vec<(String, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        out.push_str("  No model data recorded yet.\n");
+    } else {
+        let max_tokens = rows.first().map(|(_, _, t)| *t).unwrap_or(0);
+        let max_name_len = rows.iter().map(|(m, _, _)| m.len()).max().unwrap_or(0);
+        for (model, sessions, tokens) in &rows {
+            let bar = make_bar(*tokens, max_tokens, 20);
+            fmt::write(
+                &mut out,
+                format_args!(
+                    "  {:<width$}  {:>8} tokens  {:>4} sessions  {}\n",
+                    model,
+                    format_number(*tokens),
+                    format_number(*sessions),
+                    bar,
+                    width = max_name_len,
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    out.push('\n');
+    out
+}
+
 fn format_tokens_section(conn: &Connection) -> String {
     let mut out = String::new();
     out.push_str("--- Token Usage ---\n");
@@ -196,11 +243,43 @@ fn format_tokens_section(conn: &Connection) -> String {
         .unwrap();
     }
 
-    // Approximate cost using Claude Sonnet 4 pricing
-    let cost = estimate_cost(input_tokens, cache_creation, cache_read, output_tokens);
+    // Per-model cost breakdown
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(model, ''), SUM(input_tokens), SUM(cache_creation_tokens), SUM(cache_read_tokens), SUM(output_tokens)
+             FROM token_usage GROUP BY model",
+        )
+        .unwrap();
+    let model_rows: Vec<(String, i64, i64, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut total_cost = 0.0;
+    let mut model_costs: Vec<(String, f64)> = Vec::new();
+    for (model, inp, cc, cr, out_tok) in &model_rows {
+        let cost = estimate_cost_for_model(model, *inp, *cc, *cr, *out_tok);
+        total_cost += cost;
+        if !model.is_empty() {
+            model_costs.push((model.clone(), cost));
+        }
+    }
+
+    // Show per-model costs when there are multiple models
+    if model_costs.len() > 1 {
+        for (model, cost) in &model_costs {
+            fmt::write(
+                &mut out,
+                format_args!("  Est. cost ({}): {:>width$}\n", model, format_cost(*cost), width = 30 - model.len()),
+            )
+            .unwrap();
+        }
+    }
+
     fmt::write(
         &mut out,
-        format_args!("  Est. cost (approx):  {:>11}\n", format_cost(cost)),
+        format_args!("  Est. cost (total):   {:>11}\n", format_cost(total_cost)),
     )
     .unwrap();
 
@@ -447,11 +526,37 @@ pub fn format_cost(cost: f64) -> String {
 
 /// Estimate cost using approximate Claude Sonnet 4 pricing.
 /// Input: $3/MTok, Cache creation: $3.75/MTok, Cache read: $0.30/MTok, Output: $15/MTok
+#[allow(dead_code)]
 pub fn estimate_cost(input: i64, cache_creation: i64, cache_read: i64, output: i64) -> f64 {
     (input as f64 * 3.0 / 1_000_000.0)
         + (cache_creation as f64 * 3.75 / 1_000_000.0)
         + (cache_read as f64 * 0.30 / 1_000_000.0)
         + (output as f64 * 15.0 / 1_000_000.0)
+}
+
+/// Estimate cost using model-specific pricing.
+/// Opus: $15 / $18.75 / $1.50 / $75 per MTok
+/// Haiku: $0.80 / $1.00 / $0.08 / $4 per MTok
+/// Sonnet/default: $3 / $3.75 / $0.30 / $15 per MTok
+pub fn estimate_cost_for_model(
+    model: &str,
+    input: i64,
+    cache_creation: i64,
+    cache_read: i64,
+    output: i64,
+) -> f64 {
+    let (input_rate, cache_create_rate, cache_read_rate, output_rate) =
+        if model.contains("opus") {
+            (15.0, 18.75, 1.50, 75.0)
+        } else if model.contains("haiku") {
+            (0.80, 1.00, 0.08, 4.0)
+        } else {
+            (3.0, 3.75, 0.30, 15.0)
+        };
+    (input as f64 * input_rate / 1_000_000.0)
+        + (cache_creation as f64 * cache_create_rate / 1_000_000.0)
+        + (cache_read as f64 * cache_read_rate / 1_000_000.0)
+        + (output as f64 * output_rate / 1_000_000.0)
 }
 
 /// Shorten a path for display: replace home dir with ~, truncate to max_len.
@@ -671,6 +776,8 @@ mod tests {
         assert!(report.contains("Total prompts:"));
         assert!(report.contains("Avg per session:"));
         assert!(report.contains("Avg length:"));
+        assert!(report.contains("--- Models ---"));
+        assert!(report.contains("claude-sonnet-4-20250514"));
         assert!(report.contains("Input tokens:"));
         assert!(report.contains("Cache hit rate:"));
         assert!(report.contains("Est. cost"));
@@ -894,5 +1001,93 @@ mod tests {
         let section = format_prompts_section(&conn);
         assert!(section.contains("Total prompts:"));
         assert!(section.contains("Avg length:"));
+    }
+
+    #[test]
+    fn estimate_cost_for_model_opus() {
+        let cost = estimate_cost_for_model("claude-opus-4-20250514", 1_000_000, 0, 0, 0);
+        assert!((cost - 15.0).abs() < 0.01);
+        let cost = estimate_cost_for_model("claude-opus-4-20250514", 0, 0, 0, 1_000_000);
+        assert!((cost - 75.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn estimate_cost_for_model_haiku() {
+        let cost = estimate_cost_for_model("claude-haiku-4-20250514", 1_000_000, 0, 0, 0);
+        assert!((cost - 0.80).abs() < 0.01);
+        let cost = estimate_cost_for_model("claude-haiku-4-20250514", 0, 0, 0, 1_000_000);
+        assert!((cost - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn estimate_cost_for_model_sonnet() {
+        let cost = estimate_cost_for_model("claude-sonnet-4-20250514", 1_000_000, 0, 0, 0);
+        assert!((cost - 3.0).abs() < 0.01);
+        let cost = estimate_cost_for_model("claude-sonnet-4-20250514", 0, 0, 0, 1_000_000);
+        assert!((cost - 15.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn estimate_cost_for_model_unknown() {
+        // Unknown models fall back to sonnet pricing
+        let cost = estimate_cost_for_model("some-unknown-model", 1_000_000, 0, 0, 0);
+        assert!((cost - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn estimate_cost_for_model_all_components() {
+        let cost = estimate_cost_for_model(
+            "claude-opus-4-20250514",
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+        let expected = 15.0 + 18.75 + 1.50 + 75.0;
+        assert!((cost - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn format_models_section_empty() {
+        let conn = test_conn();
+        let section = format_models_section(&conn);
+        assert!(section.contains("--- Models ---"));
+        assert!(section.contains("No model data recorded yet."));
+    }
+
+    #[test]
+    fn format_models_section_with_data() {
+        let conn = test_conn();
+        db::insert_token_usage(&conn, "s1", "ts", "claude-sonnet-4-20250514", 1000, 0, 0, 500, 1).unwrap();
+        let section = format_models_section(&conn);
+        assert!(section.contains("--- Models ---"));
+        assert!(section.contains("claude-sonnet-4-20250514"));
+        assert!(section.contains("tokens"));
+        assert!(section.contains("sessions"));
+        assert!(section.contains("\u{2588}"));
+    }
+
+    #[test]
+    fn format_tokens_section_multi_model_cost() {
+        let conn = test_conn();
+        db::insert_token_usage(&conn, "s1", "ts", "claude-sonnet-4-20250514", 1_000_000, 0, 0, 0, 1).unwrap();
+        db::insert_token_usage(&conn, "s2", "ts", "claude-opus-4-20250514", 1_000_000, 0, 0, 0, 1).unwrap();
+
+        let section = format_tokens_section(&conn);
+        // Should show per-model costs when multiple models exist
+        assert!(section.contains("Est. cost (claude-sonnet-4-20250514)"));
+        assert!(section.contains("Est. cost (claude-opus-4-20250514)"));
+        assert!(section.contains("Est. cost (total)"));
+    }
+
+    #[test]
+    fn format_tokens_section_single_model_no_breakdown() {
+        let conn = test_conn();
+        db::insert_token_usage(&conn, "s1", "ts", "claude-sonnet-4-20250514", 1000, 0, 0, 500, 1).unwrap();
+
+        let section = format_tokens_section(&conn);
+        // Single model should not show per-model breakdown, just total
+        assert!(!section.contains("Est. cost (claude-sonnet"));
+        assert!(section.contains("Est. cost (total)"));
     }
 }
