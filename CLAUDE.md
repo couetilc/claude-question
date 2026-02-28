@@ -69,5 +69,5 @@ All tests must pass with 100% code coverage.
 
 ```
 cargo test
-cargo tarpaulin --skip-clean
+cargo tarpaulin --skip-clean --fail-under 100
 ```

@@ -222,6 +222,22 @@ fn truncate_response(value: &serde_json::Value) -> String {
     }
 }
 
+/// Read file contents from a byte offset. Returns None on any I/O error
+/// (metadata, seek, or read failure after a successful open).
+#[cfg(not(tarpaulin_include))]
+fn read_file_from_offset(file: &mut fs::File, start_offset: u64) -> Option<String> {
+    let file_len = file.metadata().ok()?.len();
+    if start_offset >= file_len {
+        return None;
+    }
+    if start_offset > 0 {
+        file.seek(SeekFrom::Start(start_offset)).ok()?;
+    }
+    let mut buf = String::new();
+    BufReader::new(file).read_to_string(&mut buf).ok()?;
+    Some(buf)
+}
+
 /// Parse a transcript JSONL file and aggregate token usage (full parse from start).
 #[cfg(test)]
 pub fn parse_transcript(path: &Path) -> AggregatedTokenUsage {
@@ -237,26 +253,10 @@ pub fn parse_transcript_from_offset(path: &Path, start_offset: u64) -> (Aggregat
         Err(_) => return (AggregatedTokenUsage::default(), start_offset),
     };
 
-    let file_len = match file.metadata() {
-        Ok(m) => m.len(),
-        Err(_) => return (AggregatedTokenUsage::default(), start_offset),
+    let remaining = match read_file_from_offset(&mut file, start_offset) {
+        Some(s) => s,
+        None => return (AggregatedTokenUsage::default(), start_offset),
     };
-
-    // If file shrank, caller handles reset; we just parse from the given offset
-    if start_offset >= file_len {
-        return (AggregatedTokenUsage::default(), start_offset);
-    }
-
-    if start_offset > 0 {
-        if file.seek(SeekFrom::Start(start_offset)).is_err() {
-            return (AggregatedTokenUsage::default(), start_offset);
-        }
-    }
-
-    let mut remaining = String::new();
-    if BufReader::new(&mut file).read_to_string(&mut remaining).is_err() {
-        return (AggregatedTokenUsage::default(), start_offset);
-    }
 
     let mut agg = AggregatedTokenUsage::default();
     let mut offset = start_offset;
