@@ -145,7 +145,7 @@ fn format_models_section(conn: &Connection) -> String {
 
     let mut stmt = conn
         .prepare(
-            "SELECT model, COUNT(*) as sessions,
+            "SELECT model, COUNT(DISTINCT session_id) as sessions,
                     SUM(input_tokens + cache_creation_tokens + cache_read_tokens + output_tokens) as total_tokens
              FROM token_usage WHERE model IS NOT NULL AND model != ''
              GROUP BY model ORDER BY total_tokens DESC",
