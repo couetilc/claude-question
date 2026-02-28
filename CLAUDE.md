@@ -38,6 +38,15 @@ src/
 - `chrono` — UTC timestamps
 - `dirs` — cross-platform home directory resolution
 
+## Testing
+
+All tests must pass with 100% code coverage.
+
+```
+cargo test
+cargo tarpaulin --skip-clean
+```
+
 ## Data format
 
 Each line in `~/.claude/tool-usage.jsonl` is a JSON object:
