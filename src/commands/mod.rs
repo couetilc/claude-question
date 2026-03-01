@@ -1,3 +1,4 @@
+pub mod backfill;
 pub mod hook;
 pub mod install;
 pub mod migrate;

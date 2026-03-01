@@ -336,6 +336,18 @@ pub fn get_pending_plan_tool_use_ids(
     Ok(ids)
 }
 
+/// Get all plan tool_use_ids for batch deduplication.
+pub fn get_all_plan_tool_use_ids(
+    conn: &Connection,
+) -> Result<std::collections::HashSet<String>, Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare("SELECT tool_use_id FROM plans WHERE tool_use_id IS NOT NULL")?;
+    let ids: std::collections::HashSet<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(ids)
+}
+
 /// Get the transcript_path for a given session.
 pub fn get_transcript_path(
     conn: &Connection,
@@ -759,5 +771,23 @@ mod tests {
         let ids = get_pending_plan_tool_use_ids(&conn, "s1").unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], "toolu_c");
+    }
+
+    #[test]
+    fn get_all_plan_tool_use_ids_empty() {
+        let conn = mem_db();
+        let ids = get_all_plan_tool_use_ids(&conn).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn get_all_plan_tool_use_ids_returns_ids() {
+        let conn = mem_db();
+        insert_plan(&conn, "s1", "toolu_a", "ts1", "plan a").unwrap();
+        insert_plan(&conn, "s2", "toolu_b", "ts2", "plan b").unwrap();
+        let ids = get_all_plan_tool_use_ids(&conn).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("toolu_a"));
+        assert!(ids.contains("toolu_b"));
     }
 }

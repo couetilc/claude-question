@@ -16,6 +16,7 @@ cargo build --release
 - **`install`** — Registers all 6 hooks in `~/.claude/settings.json`.
 - **`uninstall`** — Removes all hooks from settings and optionally deletes the database and legacy log.
 - **`migrate`** — Imports legacy `~/.claude/tool-usage.jsonl` records into the `tool_uses` table.
+- **`backfill`** — Scans `~/.claude/projects/` transcript files, extracts historical ExitPlanMode plans, and imports them into the `plans` table.
 - **`query`** — Runs an ad-hoc SQL query against the tracking database. Usage: `claude-track query "SELECT ..."`.
 
 ## Hook coverage
@@ -39,6 +40,7 @@ src/
   db.rs                # SQLite schema, init, insert/update/query helpers
   commands/
     mod.rs
+    backfill.rs        # backfill subcommand (transcript plans → SQLite)
     hook.rs            # hook subcommand (dispatches all 6 events)
     stats.rs           # stats subcommand (queries SQLite)
     install.rs         # install subcommand (registers 6 hooks)

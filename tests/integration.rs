@@ -36,6 +36,7 @@ fn cli_help_flag() {
     assert!(stdout.contains("install"));
     assert!(stdout.contains("uninstall"));
     assert!(stdout.contains("migrate"));
+    assert!(stdout.contains("backfill"));
     assert!(stdout.contains("query"));
 }
 
@@ -162,6 +163,20 @@ fn cli_migrate_subcommand_runs() {
     // Either migrates data or says no file found
     assert!(
         stdout.contains("Migrated") || stdout.contains("No JSONL file found") || stdout.contains("Nothing to migrate")
+    );
+}
+
+#[test]
+fn cli_backfill_subcommand_runs() {
+    let output = Command::new(binary_path())
+        .arg("backfill")
+        .output()
+        .expect("failed to run binary");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Scanned") || stdout.contains("No projects directory") || stdout.contains("Nothing to backfill")
     );
 }
 

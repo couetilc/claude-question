@@ -23,6 +23,8 @@ enum Commands {
     Uninstall,
     /// Import legacy JSONL data into SQLite
     Migrate,
+    /// Backfill plans from historical transcript files
+    Backfill,
     /// Run an ad-hoc SQL query against the tracking database
     Query {
         /// The SQL query to execute
@@ -39,6 +41,7 @@ fn main() {
         Commands::Install => commands::install::run(),
         Commands::Uninstall => commands::uninstall::run(),
         Commands::Migrate => commands::migrate::run(),
+        Commands::Backfill => commands::backfill::run(),
         Commands::Query { ref sql } => commands::query::run(sql),
     }
 }
