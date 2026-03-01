@@ -154,6 +154,14 @@ fn handle_stop(
             new_calls,
             new_offset as i64,
         )?;
+
+        let pending_ids = db::get_pending_plan_tool_use_ids(conn, session_id)?;
+        if !pending_ids.is_empty() {
+            let acceptances = parse_plan_acceptances(path, &pending_ids);
+            for (tool_use_id, accepted) in acceptances {
+                db::update_plan_accepted(conn, &tool_use_id, accepted)?;
+            }
+        }
     }
     Ok(())
 }
@@ -169,15 +177,78 @@ fn handle_pre_tool_use(
         .map(|v| serde_json::to_string(v).unwrap_or_default())
         .unwrap_or_default();
 
+    let session_id = input.session_id.as_deref().unwrap_or_default();
+    let tool_use_id = input.tool_use_id.as_deref().unwrap_or_default();
+
     db::insert_tool_use(
         conn,
-        input.tool_use_id.as_deref().unwrap_or_default(),
-        input.session_id.as_deref().unwrap_or_default(),
+        tool_use_id,
+        session_id,
         input.tool_name.as_deref().unwrap_or_default(),
         now,
         input.cwd.as_deref().unwrap_or_default(),
         &input_json,
-    )
+    )?;
+
+    if input.tool_name.as_deref() == Some("ExitPlanMode") {
+        let plan_text = input
+            .tool_input
+            .as_ref()
+            .and_then(|v| v.get("plan"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        db::insert_plan(conn, session_id, tool_use_id, now, plan_text)?;
+    }
+
+    Ok(())
+}
+
+/// Parse transcript JSONL for plan acceptance/rejection results.
+/// For each matching tool_use_id, returns (tool_use_id, accepted).
+/// `is_error` absent → accepted, `is_error: true` → rejected.
+pub fn parse_plan_acceptances(path: &Path, tool_use_ids: &[String]) -> Vec<(String, bool)> {
+    if tool_use_ids.is_empty() {
+        return Vec::new();
+    }
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut results = Vec::new();
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if val.get("type").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        let content_arr = match val
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        {
+            Some(arr) => arr,
+            None => continue,
+        };
+        for block in content_arr {
+            if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+                continue;
+            }
+            let tuid = match block.get("tool_use_id").and_then(|v| v.as_str()) {
+                Some(id) => id,
+                None => continue,
+            };
+            if tool_use_ids.iter().any(|id| id == tuid) {
+                let is_error = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                results.push((tuid.to_string(), !is_error));
+            }
+        }
+    }
+    results
 }
 
 fn handle_post_tool_use(
@@ -1061,5 +1132,293 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM token_usage WHERE session_id='s1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // --- Plan tracking tests ---
+
+    #[test]
+    fn dispatch_pre_tool_use_exit_plan_mode() {
+        let conn = test_conn();
+        let json = r#"{"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"ExitPlanMode","tool_use_id":"toolu_plan1","tool_input":{"plan":"Build a REST API"},"cwd":"/proj"}"#;
+        dispatch(Cursor::new(json), &conn).unwrap();
+
+        // Should be in tool_uses
+        let tool: String = conn
+            .query_row("SELECT tool_name FROM tool_uses WHERE tool_use_id='toolu_plan1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tool, "ExitPlanMode");
+
+        // Should also be in plans
+        let (plan_text, accepted): (String, Option<i32>) = conn
+            .query_row(
+                "SELECT plan_text, accepted FROM plans WHERE tool_use_id='toolu_plan1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(plan_text, "Build a REST API");
+        assert!(accepted.is_none());
+    }
+
+    #[test]
+    fn dispatch_pre_tool_use_exit_plan_mode_no_plan_field() {
+        let conn = test_conn();
+        let json = r#"{"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"ExitPlanMode","tool_use_id":"toolu_plan1","tool_input":{},"cwd":"/proj"}"#;
+        dispatch(Cursor::new(json), &conn).unwrap();
+
+        let plan_text: String = conn
+            .query_row("SELECT plan_text FROM plans WHERE tool_use_id='toolu_plan1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(plan_text, "");
+    }
+
+    #[test]
+    fn dispatch_pre_tool_use_non_plan_tool() {
+        let conn = test_conn();
+        let json = r#"{"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"Read","tool_use_id":"tu1","tool_input":{"file_path":"/foo"},"cwd":"/proj"}"#;
+        dispatch(Cursor::new(json), &conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM plans", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn dispatch_stop_resolves_accepted_plan() {
+        let dir = TempDir::new().unwrap();
+        let transcript_path = dir.path().join("transcript.jsonl");
+        let conn = test_conn();
+
+        // Insert a pending plan
+        db::insert_plan(&conn, "s1", "toolu_plan1", "ts1", "my plan").unwrap();
+
+        // Write transcript with accepted tool_result and an assistant line for token parsing
+        let transcript = format!(
+            "{}\n{}\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_plan1","content":"User has approved your plan."}]}}"#,
+            r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        );
+        fs::write(&transcript_path, &transcript).unwrap();
+
+        let json = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s1","transcript_path":"{}"}}"#,
+            transcript_path.display()
+        );
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        let accepted: i32 = conn
+            .query_row("SELECT accepted FROM plans WHERE tool_use_id='toolu_plan1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(accepted, 1);
+    }
+
+    #[test]
+    fn dispatch_stop_resolves_rejected_plan() {
+        let dir = TempDir::new().unwrap();
+        let transcript_path = dir.path().join("transcript.jsonl");
+        let conn = test_conn();
+
+        db::insert_plan(&conn, "s1", "toolu_plan1", "ts1", "my plan").unwrap();
+
+        let transcript = format!(
+            "{}\n{}\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_plan1","content":"The user doesn't want to proceed.","is_error":true}]}}"#,
+            r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        );
+        fs::write(&transcript_path, &transcript).unwrap();
+
+        let json = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s1","transcript_path":"{}"}}"#,
+            transcript_path.display()
+        );
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        let accepted: i32 = conn
+            .query_row("SELECT accepted FROM plans WHERE tool_use_id='toolu_plan1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(accepted, 0);
+    }
+
+    #[test]
+    fn dispatch_stop_no_pending_plans() {
+        let dir = TempDir::new().unwrap();
+        let transcript_path = dir.path().join("transcript.jsonl");
+        let transcript_content = r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        fs::write(&transcript_path, format!("{transcript_content}\n")).unwrap();
+
+        let conn = test_conn();
+        let json = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s1","transcript_path":"{}"}}"#,
+            transcript_path.display()
+        );
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        // Token usage should still work
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM token_usage WHERE session_id='s1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn dispatch_stop_multiple_plans_mixed() {
+        let dir = TempDir::new().unwrap();
+        let transcript_path = dir.path().join("transcript.jsonl");
+        let conn = test_conn();
+
+        db::insert_plan(&conn, "s1", "toolu_a", "ts1", "plan a").unwrap();
+        db::insert_plan(&conn, "s1", "toolu_b", "ts2", "plan b").unwrap();
+
+        let transcript = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":"User has approved your plan."}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_b","content":"The user doesn't want to proceed.","is_error":true}]}}"#,
+            r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        );
+        fs::write(&transcript_path, &transcript).unwrap();
+
+        let json = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s1","transcript_path":"{}"}}"#,
+            transcript_path.display()
+        );
+        dispatch(Cursor::new(json.as_bytes()), &conn).unwrap();
+
+        let accepted_a: i32 = conn
+            .query_row("SELECT accepted FROM plans WHERE tool_use_id='toolu_a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(accepted_a, 1);
+
+        let accepted_b: i32 = conn
+            .query_row("SELECT accepted FROM plans WHERE tool_use_id='toolu_b'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(accepted_b, 0);
+    }
+
+    // --- parse_plan_acceptances tests ---
+
+    #[test]
+    fn parse_plan_acceptances_accepted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_plan1","content":"User has approved your plan."}]}}"#;
+        fs::write(&path, format!("{content}\n")).unwrap();
+
+        let results = parse_plan_acceptances(&path, &["toolu_plan1".to_string()]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], ("toolu_plan1".to_string(), true));
+    }
+
+    #[test]
+    fn parse_plan_acceptances_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_plan1","content":"The user doesn't want to proceed.","is_error":true}]}}"#;
+        fs::write(&path, format!("{content}\n")).unwrap();
+
+        let results = parse_plan_acceptances(&path, &["toolu_plan1".to_string()]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], ("toolu_plan1".to_string(), false));
+    }
+
+    #[test]
+    fn parse_plan_acceptances_mixed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = format!(
+            "{}\n{}\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":"User has approved your plan."}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_b","content":"The user doesn't want to proceed.","is_error":true}]}}"#,
+        );
+        fs::write(&path, content).unwrap();
+
+        let results = parse_plan_acceptances(
+            &path,
+            &["toolu_a".to_string(), "toolu_b".to_string()],
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&("toolu_a".to_string(), true)));
+        assert!(results.contains(&("toolu_b".to_string(), false)));
+    }
+
+    #[test]
+    fn parse_plan_acceptances_no_matching_ids() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_other","content":"User has approved your plan."}]}}"#;
+        fs::write(&path, format!("{content}\n")).unwrap();
+
+        let results = parse_plan_acceptances(&path, &["toolu_plan1".to_string()]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_acceptances_missing_file() {
+        let results = parse_plan_acceptances(
+            Path::new("/nonexistent/path.jsonl"),
+            &["toolu_plan1".to_string()],
+        );
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_acceptances_empty_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        fs::write(&path, "").unwrap();
+
+        let results = parse_plan_acceptances(&path, &["toolu_plan1".to_string()]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_acceptances_string_content() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        // User message with string content (not array) — should be skipped
+        let content = r#"{"type":"user","message":{"role":"user","content":"hello world"}}"#;
+        fs::write(&path, format!("{content}\n")).unwrap();
+
+        let results = parse_plan_acceptances(&path, &["toolu_plan1".to_string()]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_acceptances_empty_ids() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        fs::write(&path, "anything\n").unwrap();
+
+        let results = parse_plan_acceptances(&path, &[]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_acceptances_skips_empty_and_invalid_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = format!(
+            "\n{}\n{}\n{}\n",
+            "not json at all",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"},{"type":"tool_result","tool_use_id":"toolu_plan1","content":"User has approved your plan."}]}}"#,
+            "",
+        );
+        fs::write(&path, content).unwrap();
+
+        let results = parse_plan_acceptances(&path, &["toolu_plan1".to_string()]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], ("toolu_plan1".to_string(), true));
+    }
+
+    #[test]
+    fn parse_plan_acceptances_skips_block_without_tool_use_id() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        // tool_result block missing tool_use_id field
+        let content = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"some content"}]}}"#;
+        fs::write(&path, format!("{content}\n")).unwrap();
+
+        let results = parse_plan_acceptances(&path, &["toolu_plan1".to_string()]);
+        assert!(results.is_empty());
     }
 }

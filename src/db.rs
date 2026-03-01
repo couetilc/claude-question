@@ -60,6 +60,15 @@ pub fn init_db(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
             cache_read_tokens       INTEGER DEFAULT 0,
             output_tokens           INTEGER DEFAULT 0,
             api_call_count          INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS plans (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id   TEXT,
+            tool_use_id  TEXT,
+            timestamp    TEXT,
+            plan_text    TEXT,
+            accepted     INTEGER
         );",
     )?;
     // Migration: add last_transcript_offset column (ignore error if it already exists)
@@ -283,6 +292,50 @@ pub fn dedup_token_usage(conn: &Connection) -> Result<usize, Box<dyn std::error:
     Ok(deleted)
 }
 
+/// Insert a plan record (from PreToolUse ExitPlanMode).
+pub fn insert_plan(
+    conn: &Connection,
+    session_id: &str,
+    tool_use_id: &str,
+    timestamp: &str,
+    plan_text: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute(
+        "INSERT INTO plans (session_id, tool_use_id, timestamp, plan_text)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![session_id, tool_use_id, timestamp, plan_text],
+    )?;
+    Ok(())
+}
+
+/// Update a plan's accepted status by tool_use_id. No-op if no matching row.
+pub fn update_plan_accepted(
+    conn: &Connection,
+    tool_use_id: &str,
+    accepted: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute(
+        "UPDATE plans SET accepted = ?1 WHERE tool_use_id = ?2",
+        params![accepted as i32, tool_use_id],
+    )?;
+    Ok(())
+}
+
+/// Get tool_use_ids of plans with accepted IS NULL for a given session.
+pub fn get_pending_plan_tool_use_ids(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT tool_use_id FROM plans WHERE session_id = ?1 AND accepted IS NULL",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(params![session_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(ids)
+}
+
 /// Get the transcript_path for a given session.
 pub fn get_transcript_path(
     conn: &Connection,
@@ -322,6 +375,7 @@ mod tests {
         assert!(tables.contains(&"tool_uses".to_string()));
         assert!(tables.contains(&"prompts".to_string()));
         assert!(tables.contains(&"token_usage".to_string()));
+        assert!(tables.contains(&"plans".to_string()));
     }
 
     #[test]
@@ -591,12 +645,12 @@ mod tests {
         // Verify tables exist
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sessions','tool_uses','prompts','token_usage')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sessions','tool_uses','prompts','token_usage','plans')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
         assert!(path.exists());
     }
 
@@ -604,5 +658,106 @@ mod tests {
     fn db_path_returns_expected() {
         let path = db_path().unwrap();
         assert!(path.ends_with(".claude/claude-track.db"));
+    }
+
+    #[test]
+    fn plans_table_created() {
+        let conn = mem_db();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='plans'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn insert_plan_basic() {
+        let conn = mem_db();
+        insert_plan(&conn, "s1", "toolu_plan1", "ts1", "My plan text").unwrap();
+        let (session, tool_use_id, ts, plan_text, accepted): (String, String, String, String, Option<i32>) = conn
+            .query_row(
+                "SELECT session_id, tool_use_id, timestamp, plan_text, accepted FROM plans WHERE tool_use_id='toolu_plan1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(session, "s1");
+        assert_eq!(tool_use_id, "toolu_plan1");
+        assert_eq!(ts, "ts1");
+        assert_eq!(plan_text, "My plan text");
+        assert!(accepted.is_none());
+    }
+
+    #[test]
+    fn update_plan_accepted_true() {
+        let conn = mem_db();
+        insert_plan(&conn, "s1", "toolu_plan1", "ts1", "plan").unwrap();
+        update_plan_accepted(&conn, "toolu_plan1", true).unwrap();
+        let accepted: i32 = conn
+            .query_row("SELECT accepted FROM plans WHERE tool_use_id='toolu_plan1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(accepted, 1);
+    }
+
+    #[test]
+    fn update_plan_accepted_false() {
+        let conn = mem_db();
+        insert_plan(&conn, "s1", "toolu_plan1", "ts1", "plan").unwrap();
+        update_plan_accepted(&conn, "toolu_plan1", false).unwrap();
+        let accepted: i32 = conn
+            .query_row("SELECT accepted FROM plans WHERE tool_use_id='toolu_plan1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(accepted, 0);
+    }
+
+    #[test]
+    fn update_plan_accepted_no_match() {
+        let conn = mem_db();
+        // Should not error when no matching row
+        update_plan_accepted(&conn, "nonexistent", true).unwrap();
+    }
+
+    #[test]
+    fn get_pending_plan_tool_use_ids_returns_pending() {
+        let conn = mem_db();
+        insert_plan(&conn, "s1", "toolu_a", "ts1", "plan a").unwrap();
+        insert_plan(&conn, "s1", "toolu_b", "ts2", "plan b").unwrap();
+        let ids = get_pending_plan_tool_use_ids(&conn, "s1").unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"toolu_a".to_string()));
+        assert!(ids.contains(&"toolu_b".to_string()));
+    }
+
+    #[test]
+    fn get_pending_plan_tool_use_ids_empty() {
+        let conn = mem_db();
+        let ids = get_pending_plan_tool_use_ids(&conn, "s1").unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn get_pending_plan_tool_use_ids_filters_by_session() {
+        let conn = mem_db();
+        insert_plan(&conn, "s1", "toolu_a", "ts1", "plan a").unwrap();
+        insert_plan(&conn, "s2", "toolu_b", "ts2", "plan b").unwrap();
+        let ids = get_pending_plan_tool_use_ids(&conn, "s1").unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], "toolu_a");
+    }
+
+    #[test]
+    fn get_pending_plan_tool_use_ids_ignores_resolved() {
+        let conn = mem_db();
+        insert_plan(&conn, "s1", "toolu_a", "ts1", "plan a").unwrap();
+        insert_plan(&conn, "s1", "toolu_b", "ts2", "plan b").unwrap();
+        insert_plan(&conn, "s1", "toolu_c", "ts3", "plan c").unwrap();
+        update_plan_accepted(&conn, "toolu_a", true).unwrap();
+        update_plan_accepted(&conn, "toolu_b", false).unwrap();
+        let ids = get_pending_plan_tool_use_ids(&conn, "s1").unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], "toolu_c");
     }
 }
