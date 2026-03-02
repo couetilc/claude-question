@@ -11,7 +11,6 @@ struct DiscoveredPlan {
     tool_use_id: String,
     timestamp: String,
     plan_text: String,
-    accepted: Option<bool>,
 }
 
 /// Backfill plans from historical transcript files.
@@ -75,9 +74,6 @@ pub fn backfill_from(
                 &plan.timestamp,
                 &plan.plan_text,
             )?;
-            if let Some(accepted) = plan.accepted {
-                db::update_plan_accepted(conn, &plan.tool_use_id, accepted)?;
-            }
             existing_ids.insert(plan.tool_use_id);
             total_imported += 1;
         }
@@ -125,17 +121,14 @@ fn find_transcripts(projects_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Extract ExitPlanMode plans from a transcript file.
-/// Single-pass: collect tool_use blocks (assistant lines) and tool_result blocks (user lines),
-/// then combine by tool_use_id.
+/// Scans assistant lines for ExitPlanMode tool_use blocks.
 fn extract_plans_from_transcript(path: &Path, session_id: &str) -> Vec<DiscoveredPlan> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
 
-    // Collect ExitPlanMode tool_use blocks and tool_result blocks
-    let mut plan_uses: Vec<(String, String, String)> = Vec::new(); // (tool_use_id, timestamp, plan_text)
-    let mut results: std::collections::HashMap<String, bool> = std::collections::HashMap::new(); // tool_use_id -> accepted
+    let mut plans = Vec::new();
 
     for line in content.lines() {
         if line.is_empty() {
@@ -146,7 +139,10 @@ fn extract_plans_from_transcript(path: &Path, session_id: &str) -> Vec<Discovere
             Err(_) => continue,
         };
 
-        let line_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if val.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+
         let timestamp = val
             .get("timestamp")
             .and_then(|v| v.as_str())
@@ -162,58 +158,33 @@ fn extract_plans_from_transcript(path: &Path, session_id: &str) -> Vec<Discovere
             None => continue,
         };
 
-        if line_type == "assistant" {
-            for block in content_arr {
-                if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
-                    continue;
-                }
-                if block.get("name").and_then(|v| v.as_str()) != Some("ExitPlanMode") {
-                    continue;
-                }
-                let id = match block.get("id").and_then(|v| v.as_str()) {
-                    Some(id) => id.to_string(),
-                    None => continue,
-                };
-                let plan_text = block
-                    .get("input")
-                    .and_then(|i| i.get("plan"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                plan_uses.push((id, timestamp.clone(), plan_text));
+        for block in content_arr {
+            if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                continue;
             }
-        } else if line_type == "user" {
-            for block in content_arr {
-                if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
-                    continue;
-                }
-                let tuid = match block.get("tool_use_id").and_then(|v| v.as_str()) {
-                    Some(id) => id.to_string(),
-                    None => continue,
-                };
-                let is_error = block
-                    .get("is_error")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                results.insert(tuid, !is_error);
+            if block.get("name").and_then(|v| v.as_str()) != Some("ExitPlanMode") {
+                continue;
             }
+            let id = match block.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            let plan_text = block
+                .get("input")
+                .and_then(|i| i.get("plan"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            plans.push(DiscoveredPlan {
+                session_id: session_id.to_string(),
+                tool_use_id: id,
+                timestamp: timestamp.clone(),
+                plan_text,
+            });
         }
     }
 
-    // Combine tool_use blocks with their results
-    plan_uses
-        .into_iter()
-        .map(|(tool_use_id, timestamp, plan_text)| {
-            let accepted = results.get(&tool_use_id).copied();
-            DiscoveredPlan {
-                session_id: session_id.to_string(),
-                tool_use_id,
-                timestamp,
-                plan_text,
-                accepted,
-            }
-        })
-        .collect()
+    plans
 }
 
 #[cfg(test)]
@@ -244,34 +215,15 @@ mod tests {
         .to_string()
     }
 
-    fn make_user_result_line(tool_use_id: &str, is_error: bool) -> String {
-        let mut block = serde_json::json!({
-            "type": "tool_result",
-            "tool_use_id": tool_use_id,
-            "content": "result"
-        });
-        if is_error {
-            block["is_error"] = serde_json::json!(true);
-        }
-        serde_json::json!({
-            "type": "user",
-            "message": {
-                "content": [block]
-            }
-        })
-        .to_string()
-    }
-
     // --- extract_plans_from_transcript tests ---
 
     #[test]
-    fn extract_single_accepted_plan() {
+    fn extract_single_plan() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("session1.jsonl");
         let content = format!(
-            "{}\n{}\n",
+            "{}\n",
             make_assistant_line("toolu_1", "my plan", "2026-01-01T00:00:00Z"),
-            make_user_result_line("toolu_1", false),
         );
         fs::write(&path, content).unwrap();
 
@@ -281,38 +233,6 @@ mod tests {
         assert_eq!(plans[0].tool_use_id, "toolu_1");
         assert_eq!(plans[0].timestamp, "2026-01-01T00:00:00Z");
         assert_eq!(plans[0].plan_text, "my plan");
-        assert_eq!(plans[0].accepted, Some(true));
-    }
-
-    #[test]
-    fn extract_single_rejected_plan() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("s.jsonl");
-        let content = format!(
-            "{}\n{}\n",
-            make_assistant_line("toolu_1", "rejected plan", "2026-01-01T00:00:00Z"),
-            make_user_result_line("toolu_1", true),
-        );
-        fs::write(&path, content).unwrap();
-
-        let plans = extract_plans_from_transcript(&path, "s1");
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].accepted, Some(false));
-    }
-
-    #[test]
-    fn extract_plan_no_result_pending() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("s.jsonl");
-        let content = format!(
-            "{}\n",
-            make_assistant_line("toolu_1", "pending plan", "2026-01-01T00:00:00Z"),
-        );
-        fs::write(&path, content).unwrap();
-
-        let plans = extract_plans_from_transcript(&path, "s1");
-        assert_eq!(plans.len(), 1);
-        assert!(plans[0].accepted.is_none());
     }
 
     #[test]
@@ -320,18 +240,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("s.jsonl");
         let content = format!(
-            "{}\n{}\n{}\n{}\n",
+            "{}\n{}\n",
             make_assistant_line("toolu_1", "plan 1", "2026-01-01T00:00:00Z"),
-            make_user_result_line("toolu_1", false),
             make_assistant_line("toolu_2", "plan 2", "2026-01-01T01:00:00Z"),
-            make_user_result_line("toolu_2", true),
         );
         fs::write(&path, content).unwrap();
 
         let plans = extract_plans_from_transcript(&path, "s1");
         assert_eq!(plans.len(), 2);
-        assert_eq!(plans[0].accepted, Some(true));
-        assert_eq!(plans[1].accepted, Some(false));
+        assert_eq!(plans[0].plan_text, "plan 1");
+        assert_eq!(plans[1].plan_text, "plan 2");
     }
 
     #[test]
@@ -378,15 +296,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("s.jsonl");
         let content = format!(
-            "\n{}\n\n{}\n\n",
+            "\n{}\n\n",
             make_assistant_line("toolu_1", "plan", "2026-01-01T00:00:00Z"),
-            make_user_result_line("toolu_1", false),
         );
         fs::write(&path, content).unwrap();
 
         let plans = extract_plans_from_transcript(&path, "s1");
         assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].accepted, Some(true));
     }
 
     #[test]
@@ -516,31 +432,6 @@ mod tests {
         assert!(plans.is_empty());
     }
 
-    #[test]
-    fn extract_user_result_no_tool_use_id() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("s.jsonl");
-        let content = format!(
-            "{}\n{}\n",
-            make_assistant_line("toolu_1", "plan", "2026-01-01T00:00:00Z"),
-            // tool_result without tool_use_id
-            serde_json::json!({
-                "type": "user",
-                "message": {
-                    "content": [{
-                        "type": "tool_result",
-                        "content": "result"
-                    }]
-                }
-            }),
-        );
-        fs::write(&path, content).unwrap();
-
-        let plans = extract_plans_from_transcript(&path, "s1");
-        assert_eq!(plans.len(), 1);
-        assert!(plans[0].accepted.is_none());
-    }
-
     // --- find_transcripts tests ---
 
     #[test]
@@ -626,9 +517,8 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
 
         let content = format!(
-            "{}\n{}\n",
+            "{}\n",
             make_assistant_line("toolu_1", "my plan", "2026-01-01T00:00:00Z"),
-            make_user_result_line("toolu_1", false),
         );
         fs::write(sub.join("sess123.jsonl"), content).unwrap();
 
@@ -637,15 +527,14 @@ mod tests {
         assert!(output.contains("1 imported"));
 
         // Verify in DB
-        let (plan_text, accepted): (String, i32) = conn
+        let plan_text: String = conn
             .query_row(
-                "SELECT plan_text, accepted FROM plans WHERE tool_use_id='toolu_1'",
+                "SELECT plan_text FROM plans WHERE tool_use_id='toolu_1'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .unwrap();
         assert_eq!(plan_text, "my plan");
-        assert_eq!(accepted, 1);
     }
 
     #[test]
@@ -655,9 +544,8 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
 
         let content = format!(
-            "{}\n{}\n",
+            "{}\n",
             make_assistant_line("toolu_1", "my plan", "2026-01-01T00:00:00Z"),
-            make_user_result_line("toolu_1", false),
         );
         fs::write(sub.join("sess123.jsonl"), content).unwrap();
 

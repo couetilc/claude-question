@@ -358,33 +358,8 @@ fn format_plans_section(conn: &Connection) -> String {
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM plans", [], |r| r.get(0))
         .unwrap_or(0);
-    let accepted: i64 = conn
-        .query_row("SELECT COUNT(*) FROM plans WHERE accepted = 1", [], |r| r.get(0))
-        .unwrap_or(0);
-    let rejected: i64 = conn
-        .query_row("SELECT COUNT(*) FROM plans WHERE accepted = 0", [], |r| r.get(0))
-        .unwrap_or(0);
 
     fmt::write(&mut out, format_args!("  Total plans:     {:>10}\n", format_number(total))).unwrap();
-
-    let resolved = accepted + rejected;
-    if resolved > 0 {
-        let accept_pct = (accepted as f64 / resolved as f64) * 100.0;
-        let reject_pct = (rejected as f64 / resolved as f64) * 100.0;
-        fmt::write(
-            &mut out,
-            format_args!("  Accepted:        {:>5} ({:.1}%)\n", format_number(accepted), accept_pct),
-        )
-        .unwrap();
-        fmt::write(
-            &mut out,
-            format_args!("  Rejected:        {:>5} ({:.1}%)\n", format_number(rejected), reject_pct),
-        )
-        .unwrap();
-    } else {
-        fmt::write(&mut out, format_args!("  Accepted:        {:>10}\n", format_number(accepted))).unwrap();
-        fmt::write(&mut out, format_args!("  Rejected:        {:>10}\n", format_number(rejected))).unwrap();
-    }
 
     out.push('\n');
     out
@@ -1426,68 +1401,18 @@ mod tests {
         assert!(section.contains("--- Plans ---"));
         assert!(section.contains("Total plans:"));
         assert!(section.contains("0"));
-        // No percentages when 0 resolved
-        assert!(!section.contains('%'));
     }
 
     #[test]
-    fn format_plans_section_all_accepted() {
-        let conn = test_conn();
-        db::insert_plan(&conn, "s1", "t1", "ts", "plan").unwrap();
-        db::insert_plan(&conn, "s1", "t2", "ts", "plan").unwrap();
-        db::update_plan_accepted(&conn, "t1", true).unwrap();
-        db::update_plan_accepted(&conn, "t2", true).unwrap();
-
-        let section = format_plans_section(&conn);
-        assert!(section.contains("Total plans:"));
-        assert!(section.contains("100.0%"));
-        assert!(section.contains("0.0%"));
-    }
-
-    #[test]
-    fn format_plans_section_all_rejected() {
-        let conn = test_conn();
-        db::insert_plan(&conn, "s1", "t1", "ts", "plan").unwrap();
-        db::insert_plan(&conn, "s1", "t2", "ts", "plan").unwrap();
-        db::update_plan_accepted(&conn, "t1", false).unwrap();
-        db::update_plan_accepted(&conn, "t2", false).unwrap();
-
-        let section = format_plans_section(&conn);
-        assert!(section.contains("0.0%"));
-        assert!(section.contains("100.0%"));
-    }
-
-    #[test]
-    fn format_plans_section_mixed() {
-        let conn = test_conn();
-        for i in 0..4 {
-            db::insert_plan(&conn, "s1", &format!("t{i}"), "ts", "plan").unwrap();
-        }
-        db::update_plan_accepted(&conn, "t0", true).unwrap();
-        db::update_plan_accepted(&conn, "t1", true).unwrap();
-        db::update_plan_accepted(&conn, "t2", true).unwrap();
-        db::update_plan_accepted(&conn, "t3", false).unwrap();
-
-        let section = format_plans_section(&conn);
-        assert!(section.contains("75.0%"));
-        assert!(section.contains("25.0%"));
-    }
-
-    #[test]
-    fn format_plans_section_pending_excluded() {
+    fn format_plans_section_with_plans() {
         let conn = test_conn();
         db::insert_plan(&conn, "s1", "t1", "ts", "plan").unwrap();
         db::insert_plan(&conn, "s1", "t2", "ts", "plan").unwrap();
         db::insert_plan(&conn, "s1", "t3", "ts", "plan").unwrap();
-        db::update_plan_accepted(&conn, "t1", true).unwrap();
-        // t2 and t3 are pending
 
         let section = format_plans_section(&conn);
-        // Total should be 3
+        assert!(section.contains("Total plans:"));
         assert!(section.contains("3"));
-        // Percentages based on 1 resolved (100% accepted, 0% rejected)
-        assert!(section.contains("100.0%"));
-        assert!(section.contains("0.0%"));
     }
 
     #[test]

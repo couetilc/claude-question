@@ -57,6 +57,8 @@ Location: `~/.claude/claude-track.db`
 
 4 normalized tables: `sessions`, `tool_uses`, `prompts`, `token_usage`. See `src/db.rs` for full schema.
 
+> The `accepted` column in `plans` is deprecated (always NULL). Claude Code's "clear context and auto accept edits" records identically to rejections in transcripts, making the signal unreliable.
+
 ## Key dependencies
 
 - `clap` (derive) — CLI parsing
