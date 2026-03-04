@@ -89,6 +89,52 @@ fn tracking_since(conn: &Connection) -> Result<Option<String>, rusqlite::Error> 
     )
 }
 
+/// Compute wall-clock seconds by merging overlapping session intervals.
+fn compute_wall_clock_seconds(conn: &Connection) -> i64 {
+    let mut stmt = conn
+        .prepare(
+            "SELECT CAST((julianday(started_at) * 86400) AS INTEGER),
+                    CAST((julianday(ended_at) * 86400) AS INTEGER)
+             FROM sessions
+             WHERE started_at IS NOT NULL AND ended_at IS NOT NULL
+             ORDER BY started_at",
+        )
+        .unwrap();
+    let intervals: Vec<(i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Merge overlapping intervals
+    let mut total: i64 = 0;
+    let mut current_start: Option<i64> = None;
+    let mut current_end: i64 = 0;
+    for (start, end) in intervals {
+        match current_start {
+            None => {
+                current_start = Some(start);
+                current_end = end;
+            }
+            Some(_) if start <= current_end => {
+                // Overlapping — extend
+                if end > current_end {
+                    current_end = end;
+                }
+            }
+            Some(cs) => {
+                total += current_end - cs;
+                current_start = Some(start);
+                current_end = end;
+            }
+        }
+    }
+    if let Some(cs) = current_start {
+        total += current_end - cs;
+    }
+    total
+}
+
 fn format_sessions_section(conn: &Connection) -> String {
     let mut out = String::new();
     out.push_str("--- Sessions ---\n");
@@ -98,7 +144,15 @@ fn format_sessions_section(conn: &Connection) -> String {
         .unwrap_or(0);
     fmt::write(&mut out, format_args!("  Total sessions:  {:>10}\n", format_number(total))).unwrap();
 
-    // Total duration: sum of (ended_at - started_at) for completed sessions
+    // Wall-clock time: merge overlapping session intervals
+    let wall_clock_seconds = compute_wall_clock_seconds(conn);
+    fmt::write(
+        &mut out,
+        format_args!("  Wall-clock time: {:>10}\n", format_duration(wall_clock_seconds)),
+    )
+    .unwrap();
+
+    // Combined duration: sum of (ended_at - started_at) for all completed sessions (additive)
     let total_seconds: i64 = conn
         .query_row(
             "SELECT COALESCE(SUM(
@@ -110,7 +164,7 @@ fn format_sessions_section(conn: &Connection) -> String {
         .unwrap_or(0);
     fmt::write(
         &mut out,
-        format_args!("  Total duration:  {:>10}\n", format_duration(total_seconds)),
+        format_args!("  Combined time:   {:>10}\n", format_duration(total_seconds)),
     )
     .unwrap();
 
@@ -1170,7 +1224,8 @@ mod tests {
         let section = format_sessions_section(&conn);
         // All labels should have consistent padding
         assert!(section.contains("Total sessions:"));
-        assert!(section.contains("Total duration:"));
+        assert!(section.contains("Wall-clock time:"));
+        assert!(section.contains("Combined time:"));
         assert!(section.contains("Sessions today:"));
     }
 
