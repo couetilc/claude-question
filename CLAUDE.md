@@ -67,6 +67,19 @@ Location: `~/.claude/claude-track.db`
 - `dirs` — cross-platform home directory resolution
 - `rusqlite` (bundled) — SQLite database
 
+## Django dashboard
+
+Read-only Django frontend for the claude-track database. Located in `dashboard/`.
+
+```
+cd dashboard
+uv run python manage.py runserver         # http://localhost:8000/admin/
+uv run python manage.py createsuperuser   # first-time setup
+uv run python manage.py shell             # interactive ORM access
+```
+
+Models (`tracking/models.py`) use `managed = False` — Django never modifies the claude-track schema. A database router (`dashboard/router.py`) directs all tracking queries to `~/.claude/claude-track.db`.
+
 ## Testing
 
 All tests must pass with 100% code coverage.
