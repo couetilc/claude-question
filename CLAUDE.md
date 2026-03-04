@@ -86,5 +86,5 @@ All tests must pass with 100% code coverage.
 
 ```
 cargo test
-cargo tarpaulin --skip-clean --fail-under 100
+LLVM_PROFILE_FILE='/tmp/claude-track-%p.profraw' cargo tarpaulin --skip-clean --fail-under 100
 ```
