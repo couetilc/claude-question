@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/../terraform"
+
+export TF_VAR_aws_access_key_id="op://couetil.com/7uh7a4d43wmi67bludxocxohye/access_key_id"
+export TF_VAR_aws_secret_access_key="op://couetil.com/7uh7a4d43wmi67bludxocxohye/secret_access_key"
+
+exec op run -- terraform "$@"
