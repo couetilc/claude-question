@@ -20,7 +20,7 @@ variable "aws_secret_access_key" {
 }
 
 provider "aws" {
-  region     = "us-east-1"
+  region     = "us-east-2"
   access_key = var.aws_access_key_id
   secret_key = var.aws_secret_access_key
 }
@@ -58,7 +58,7 @@ resource "aws_iam_policy" "claude_question_s3" {
 }
 
 resource "aws_s3_bucket" "claude_question" {
-  bucket = "claude-question"
+  bucket = "claude-question-infra"
 }
 
 resource "aws_s3_bucket_public_access_block" "claude_question" {
