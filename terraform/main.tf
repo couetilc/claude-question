@@ -7,22 +7,16 @@ terraform {
       version = "~> 5.0"
     }
   }
-}
 
-variable "aws_access_key_id" {
-  type      = string
-  sensitive = true
-}
-
-variable "aws_secret_access_key" {
-  type      = string
-  sensitive = true
+  backend "s3" {
+    bucket = "claude-question-infra"
+    key    = "terraform.tfstate"
+    region = "us-east-2"
+  }
 }
 
 provider "aws" {
-  region     = "us-east-2"
-  access_key = var.aws_access_key_id
-  secret_key = var.aws_secret_access_key
+  region = "us-east-2"
 }
 
 data "aws_caller_identity" "current" {}
